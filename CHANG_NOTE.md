@@ -28,6 +28,31 @@ git push origin master
 ```
 
 ### 本地多仓库同步Push详细操作步骤
+- 添加多个仓库
+```
+git remote add gitlab ssh://git@git.ynedut.cn:2222/wjs/wjs-minio.git
+```
+
+- 本地仓库推送到多个远端仓库
+```
+git push -u origin
+git push -u gitlab
+```
+
+- OR - 同时push到多个源
+```
+git remote set-url --add --push origin ssh://git@git.ynedut.cn:2222/wjs/wjs-minio.git
+git push origin master
+```
+
+
+### 多仓库分支合并
+
+- pull upstream/master分支
+- 合并upstream/mashter到origin/master、origin/develop
+- push origin/master、origin/develop
+- 合并origin/develop到gitlab/develop
+- push gitlab
 
 
 ### MinIO源码仓库地址
