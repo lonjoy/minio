@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -1758,7 +1759,15 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 
 	setPutObjHeaders(w, objInfo, false)
 
-	writeSuccessResponseHeadersOnly(w)
+	// writeSuccessResponseHeadersOnly(w)
+
+	// Marshal API response
+	resJsonBytes, err := json.Marshal(objInfo)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	writeSuccessResponseJSON(w, resJsonBytes)
 
 	// Notify object created event.
 	sendEvent(eventArgs{
