@@ -246,6 +246,17 @@ func extractReqParams(r *http.Request) map[string]string {
 		"sourceIPAddress": handlers.GetSourceIP(r),
 		// Add more fields here.
 	}
+	// http://{host}/upload/7ca94336-1d08-4439-b308-0ad26599f70b.png?X-Wjs-OriginalFilename=Screenshot_2021_0305_080343.png&response-content-type=application/json&originalFilename=Screenshot_2021_0305_080343.png&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=admin/20210810/us-east-1/s3/aws4_request&X-Amz-Date=20210810T140139Z&X-Amz-Expires=7200&X-Amz-SignedHeaders=host&X-Amz-Signature=774fa07b412017dbf56ff356546f7e1dfccada0513ca5a4e5ddaaa270b6889f3
+	// r.URL.RawQuery = X-Wjs-OriginalFilename=default_bg.png&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=admin/20210810/us-east-1/s3/aws4_request&X-Amz-Date=20210810T142138Z&X-Amz-Expires=7200&X-Amz-SignedHeaders=host&X-Amz-Signature=ed29139cd882ec952b13382e724f6633629acf1409ecfd98986bd57ae22ebd2d
+	// 获取微讲师自定义请求参数
+	rawQuery := strings.Split(r.URL.RawQuery, "&")
+	var temp []string
+	for _, v := range rawQuery {
+		temp = strings.Split(v, "=")
+		if strings.HasPrefix(temp[0], "X-Wjs-") {
+			m[temp[0]] = temp[1]
+		}
+	}
 	if _, ok := r.Header[xhttp.MinIOSourceReplicationRequest]; ok {
 		m[xhttp.MinIOSourceReplicationRequest] = ""
 	}
