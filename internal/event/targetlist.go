@@ -20,6 +20,7 @@ package event
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 // Target - event target interface
@@ -146,6 +147,39 @@ func (list *TargetList) Send(event Event, targetIDset TargetIDSet, resCh chan<- 
 		}
 		wg.Wait()
 	}()
+}
+
+// 同步发送事件到指定目标
+// done - 通过channel返回事件是否发送完成
+// Synchronization Send - sends events to targets identified by target IDs.
+func (list *TargetList) SendSync(event Event, targetIDset TargetIDSet, resCh chan<- TargetIDResult, done chan bool) {
+	// 声明一个等待组
+	var wg sync.WaitGroup
+	for id := range targetIDset {
+		fmt.Printf("SendSync: id=%s, %d\n", id, time.Now().Unix())
+		list.RLock()
+		target, ok := list.targets[id]
+		list.RUnlock()
+		if ok {
+			// 每个任务开始时，将等待组加1
+			wg.Add(1)
+			go func(id TargetID, target Target) {
+				// 使用defer, 使方法完成时将等待组减1
+				defer wg.Done()
+				tgtRes := TargetIDResult{ID: id}
+				if err := target.Save(event); err != nil {
+					tgtRes.Err = err
+				}
+				resCh <- tgtRes
+			}(id, target)
+		} else {
+			resCh <- TargetIDResult{ID: id}
+		}
+	}
+	// 等待所有任务完成
+	wg.Wait()
+	// 向channel中写入完成标志
+	done <- true
 }
 
 // NewTargetList - creates TargetList.

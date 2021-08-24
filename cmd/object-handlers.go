@@ -1743,16 +1743,23 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 
 	// writeSuccessResponseHeadersOnly(w)
 
-	// Marshal API response
-	resJsonBytes, err := json.Marshal(objInfo)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
-	writeSuccessResponseJSON(w, resJsonBytes)
-
 	// Notify object created event.
-	sendEvent(eventArgs{
+	// sendEvent(eventArgs{
+	// 	EventName:    event.ObjectCreatedPut,
+	// 	BucketName:   bucket,
+	// 	Object:       objInfo,
+	// 	ReqParams:    extractReqParams(r),
+	// 	RespElements: extractRespElements(w),
+	// 	UserAgent:    r.UserAgent(),
+	// 	Host:         handlers.GetSourceIP(r),
+	// })
+
+	// 同步发送事件通知
+	// 申明带1个缓冲的通道，用于接收事件发送结束的通知
+	done := make(chan bool, 1)
+	// Sync Notify object created event.
+	fmt.Printf("api handler: %d\n", time.Now().Unix())
+	sendEventSync(eventArgs{
 		EventName:    event.ObjectCreatedPut,
 		BucketName:   bucket,
 		Object:       objInfo,
@@ -1760,7 +1767,19 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		RespElements: extractRespElements(w),
 		UserAgent:    r.UserAgent(),
 		Host:         handlers.GetSourceIP(r),
-	})
+	}, done)
+
+	// 等待事件发送goroutine, 会阻塞请求
+	<-done
+
+	// 返回上传成功后的文件信息
+	// Marshal API response
+	resJsonBytes, err := json.Marshal(objInfo)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	writeSuccessResponseJSON(w, resJsonBytes)
 }
 
 // PutObjectExtractHandler - PUT Object extract is an extended API

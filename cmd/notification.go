@@ -783,6 +783,20 @@ func (sys *NotificationSys) Send(args eventArgs) {
 	sys.targetList.Send(args.ToEvent(true), targetIDSet, sys.targetResCh)
 }
 
+// 同步发送通知
+// Synchronization Send - sends event data to all matching targets.
+func (sys *NotificationSys) SendSync(args eventArgs, done chan bool) {
+	sys.RLock()
+	targetIDSet := sys.bucketRulesMap[args.BucketName].Match(args.EventName, args.Object.Name)
+	sys.RUnlock()
+
+	if len(targetIDSet) == 0 {
+		return
+	}
+	fmt.Printf("SendSync: %d\n", time.Now().Unix())
+	sys.targetList.SendSync(args.ToEvent(true), targetIDSet, sys.targetResCh, done)
+}
+
 // GetNetPerfInfo - Net information
 func (sys *NotificationSys) GetNetPerfInfo(ctx context.Context) madmin.NetPerfInfo {
 	var sortedGlobalEndpoints []string
@@ -1360,6 +1374,30 @@ func sendEvent(args eventArgs) {
 	}
 
 	globalNotificationSys.Send(args)
+}
+
+// 同步发送事件
+func sendEventSync(args eventArgs, done chan bool) {
+	args.Object.Size, _ = args.Object.GetActualSize()
+
+	// avoid generating a notification for REPLICA creation event.
+	if _, ok := args.ReqParams[xhttp.MinIOSourceReplicationRequest]; ok {
+		return
+	}
+	// remove sensitive encryption entries in metadata.
+	crypto.RemoveSensitiveEntries(args.Object.UserDefined)
+	crypto.RemoveInternalEntries(args.Object.UserDefined)
+
+	// globalNotificationSys is not initialized in gateway mode.
+	if globalNotificationSys == nil {
+		return
+	}
+
+	if globalHTTPListen.NumSubscribers() > 0 {
+		globalHTTPListen.Publish(args.ToEvent(false))
+	}
+	fmt.Printf("sendEventSync: %d\n", time.Now().Unix())
+	globalNotificationSys.SendSync(args, done)
 }
 
 // GetBandwidthReports - gets the bandwidth report from all nodes including self.
