@@ -34,6 +34,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -139,6 +140,9 @@ type xlStorage struct {
 
 	ctx context.Context
 	sync.RWMutex
+
+	// mutex to prevent concurrent read operations overloading walks.
+	walkMu sync.Mutex
 }
 
 // checkPathLength - returns error if given path name length more than 255
@@ -401,6 +405,13 @@ func (s *xlStorage) readMetadata(itemPath string) ([]byte, error) {
 	stat, err := f.Stat()
 	if err != nil {
 		return nil, err
+	}
+	if stat.IsDir() {
+		return nil, &os.PathError{
+			Op:   "open",
+			Path: itemPath,
+			Err:  syscall.EISDIR,
+		}
 	}
 	return readXLMetaNoData(f, stat.Size())
 }
@@ -892,7 +903,8 @@ func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi F
 		}
 	}
 	if !lastVersion {
-		buf, err = xlMeta.AppendTo(nil)
+		buf, err = xlMeta.AppendTo(metaDataPoolGet())
+		defer metaDataPoolPut(buf)
 		if err != nil {
 			return err
 		}
@@ -959,7 +971,8 @@ func (s *xlStorage) WriteMetadata(ctx context.Context, volume, path string, fi F
 			logger.LogIf(ctx, err)
 			return err
 		}
-		buf, err := xlMeta.AppendTo(nil)
+		buf, err := xlMeta.AppendTo(metaDataPoolGet())
+		defer metaDataPoolPut(buf)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			return err
@@ -975,6 +988,7 @@ func (s *xlStorage) WriteMetadata(ctx context.Context, volume, path string, fi F
 	if err != nil && err != errFileNotFound {
 		return err
 	}
+	defer metaDataPoolPut(buf)
 
 	var xlMeta xlMetaV2
 	if !isXL2V1Format(buf) {
@@ -984,7 +998,8 @@ func (s *xlStorage) WriteMetadata(ctx context.Context, volume, path string, fi F
 			return err
 		}
 
-		buf, err = xlMeta.AppendTo(nil)
+		buf, err = xlMeta.AppendTo(metaDataPoolGet())
+		defer metaDataPoolPut(buf)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			return err
@@ -1000,7 +1015,8 @@ func (s *xlStorage) WriteMetadata(ctx context.Context, volume, path string, fi F
 			return err
 		}
 
-		buf, err = xlMeta.AppendTo(nil)
+		buf, err = xlMeta.AppendTo(metaDataPoolGet())
+		defer metaDataPoolPut(buf)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			return err
@@ -1068,8 +1084,21 @@ func (s *xlStorage) ReadVersion(ctx context.Context, volume, path, versionID str
 	if err != nil {
 		return fi, err
 	}
+	var buf []byte
+	if readData {
+		buf, err = s.ReadAll(ctx, volume, pathJoin(path, xlStorageFormatFile))
+	} else {
+		buf, err = s.readMetadata(pathJoin(volumeDir, path, xlStorageFormatFile))
+		if err != nil {
+			if osIsNotExist(err) {
+				if err = Access(volumeDir); err != nil && osIsNotExist(err) {
+					return fi, errVolumeNotFound
+				}
+			}
+			err = osErrToFileErr(err)
+		}
+	}
 
-	buf, err := s.ReadAll(ctx, volume, pathJoin(path, xlStorageFormatFile))
 	if err != nil {
 		if err == errFileNotFound {
 			if err = s.renameLegacyMetadata(volumeDir, path); err != nil {
@@ -1108,14 +1137,36 @@ func (s *xlStorage) ReadVersion(ctx context.Context, volume, path, versionID str
 		return fi, err
 	}
 
+	if len(fi.Data) == 0 {
+		// We did not read inline data, so we have no references.
+		defer metaDataPoolPut(buf)
+	}
+
 	if readData {
 		if len(fi.Data) > 0 || fi.Size == 0 {
-			if len(fi.Data) > 0 {
-				if !fi.InlineData() {
-					fi.SetInlineData()
-				}
+			if fi.InlineData() {
+				// If written with header we are fine.
+				return fi, nil
 			}
-			return fi, nil
+			if fi.Size == 0 || !(fi.VersionID != "" && fi.VersionID != nullVersionID) {
+				// If versioned we have no conflicts.
+				fi.SetInlineData()
+				return fi, nil
+			}
+
+			// For overwritten objects without header we might have a conflict with
+			// data written later.
+			// Check the data path if there is a part with data.
+			partPath := fmt.Sprintf("part.%d", fi.Parts[0].Number)
+			dataPath := pathJoin(path, fi.DataDir, partPath)
+			_, err = s.StatInfoFile(ctx, volume, dataPath)
+			if err != nil {
+				// Set the inline header, our inlined data is fine.
+				fi.SetInlineData()
+				return fi, nil
+			}
+			// Data exists on disk, remove the version from metadata.
+			fi.Data = nil
 		}
 
 		// Reading data for small objects when
@@ -1879,7 +1930,10 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 
 	var srcDataPath string
 	var dstDataPath string
-	dataDir := retainSlash(fi.DataDir)
+	var dataDir string
+	if !fi.IsRemote() {
+		dataDir = retainSlash(fi.DataDir)
+	}
 	if dataDir != "" {
 		srcDataPath = retainSlash(pathJoin(srcVolumeDir, srcPath, dataDir))
 		// make sure to always use path.Join here, do not use pathJoin as

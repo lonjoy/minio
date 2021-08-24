@@ -25,6 +25,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -252,7 +253,7 @@ type xlMetaV2 struct {
 //msgp:ignore xlMetaInlineData
 type xlMetaInlineData []byte
 
-// xlMetaInlineDataVer indicates the vesrion of the inline data structure.
+// xlMetaInlineDataVer indicates the version of the inline data structure.
 const xlMetaInlineDataVer = 1
 
 // versionOK returns whether the version is ok.
@@ -1430,20 +1431,37 @@ func (z xlMetaV2) ToFileInfo(volume, path, versionID string) (fi FileInfo, err e
 	return FileInfo{}, errFileVersionNotFound
 }
 
+// Read at most this much on initial read.
+const metaDataReadDefault = 4 << 10
+
+// Return used metadata byte slices here.
+var metaDataPool = sync.Pool{New: func() interface{} { return make([]byte, 0, metaDataReadDefault) }}
+
+// metaDataPoolGet will return a byte slice with capacity at least metaDataReadDefault.
+// It will be length 0.
+func metaDataPoolGet() []byte {
+	return metaDataPool.Get().([]byte)[:0]
+}
+
+// metaDataPoolPut will put an unused small buffer back into the pool.
+func metaDataPoolPut(buf []byte) {
+	if cap(buf) >= metaDataReadDefault && cap(buf) < metaDataReadDefault*4 {
+		metaDataPool.Put(buf)
+	}
+}
+
 // readXLMetaNoData will load the metadata, but skip data segments.
 // This should only be used when data is never interesting.
 // If data is not xlv2, it is returned in full.
 func readXLMetaNoData(r io.Reader, size int64) ([]byte, error) {
-	// Read at most this much on initial read.
-	const readDefault = 4 << 10
 	initial := size
 	hasFull := true
-	if initial > readDefault {
-		initial = readDefault
+	if initial > metaDataReadDefault {
+		initial = metaDataReadDefault
 		hasFull = false
 	}
 
-	buf := make([]byte, initial)
+	buf := metaDataPoolGet()[:initial]
 	_, err := io.ReadFull(r, buf)
 	if err != nil {
 		return nil, fmt.Errorf("readXLMetaNoData.ReadFull: %w", err)

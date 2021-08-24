@@ -14,8 +14,6 @@ WORK_DIR="$PWD/.verify-$RANDOM"
 MINIO_CONFIG_DIR="$WORK_DIR/.minio"
 MINIO=( "$PWD/minio" --config-dir "$MINIO_CONFIG_DIR" server )
 
-export GOGC=25
-
 function start_minio_3_node() {
     export MINIO_ROOT_USER=minio
     export MINIO_ROOT_PASSWORD=minio123
@@ -67,7 +65,7 @@ function start_minio_3_node() {
 
 
 function check_online() {
-    if grep -q 'Unable to initialize sub-systems' ${WORK_DIR}/dist-minio-*.log; then
+    if grep -q 'Unable to initialize' ${WORK_DIR}/dist-minio-*.log; then
         echo "1"
     fi
 }
@@ -99,11 +97,11 @@ function perform_test() {
 
     rv=$(check_online)
     if [ "$rv" == "1" ]; then
-        pkill -9 minio
         for i in $(seq 1 3); do
             echo "server$i log:"
             cat "${WORK_DIR}/dist-minio-server$i.log"
         done
+        pkill -9 minio
         echo "FAILED"
         purge "$WORK_DIR"
         exit 1
