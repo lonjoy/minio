@@ -1762,7 +1762,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	// 申明带1个缓冲的通道，用于接收事件发送结束的通知
 	done := make(chan bool, 1)
 	// Sync Notify object created event.
-	fmt.Printf("api handler: %d\n", time.Now().Unix())
+	// fmt.Printf("api handler: %d\n", time.Now().Unix())
 	sendEventSync(eventArgs{
 		EventName:    event.ObjectCreatedPut,
 		BucketName:   bucket,

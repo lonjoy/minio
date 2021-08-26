@@ -20,7 +20,6 @@ package event
 import (
 	"fmt"
 	"sync"
-	"time"
 )
 
 // Target - event target interface
@@ -156,7 +155,7 @@ func (list *TargetList) SendSync(event Event, targetIDset TargetIDSet, resCh cha
 	// 声明一个等待组
 	var wg sync.WaitGroup
 	for id := range targetIDset {
-		fmt.Printf("SendSync: id=%s, %d\n", id, time.Now().Unix())
+		// fmt.Printf("SendSync: id=%s, %d\n", id, time.Now().Unix())
 		list.RLock()
 		target, ok := list.targets[id]
 		list.RUnlock()

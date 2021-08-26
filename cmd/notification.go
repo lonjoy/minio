@@ -793,7 +793,7 @@ func (sys *NotificationSys) SendSync(args eventArgs, done chan bool) {
 	if len(targetIDSet) == 0 {
 		return
 	}
-	fmt.Printf("SendSync: %d\n", time.Now().Unix())
+	// fmt.Printf("SendSync: %d\n", time.Now().Unix())
 	sys.targetList.SendSync(args.ToEvent(true), targetIDSet, sys.targetResCh, done)
 }
 
@@ -1401,7 +1401,7 @@ func sendEventSync(args eventArgs, done chan bool) {
 	if globalHTTPListen.NumSubscribers() > 0 {
 		globalHTTPListen.Publish(args.ToEvent(false))
 	}
-	fmt.Printf("sendEventSync: %d\n", time.Now().Unix())
+	// fmt.Printf("sendEventSync: %d\n", time.Now().Unix())
 	globalNotificationSys.SendSync(args, done)
 }
 
