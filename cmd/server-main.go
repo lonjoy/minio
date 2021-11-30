@@ -23,9 +23,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math/rand"
-	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -55,9 +55,20 @@ var ServerFlags = []cli.Flag{
 		Value: ":" + GlobalMinioDefaultPort,
 		Usage: "bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname",
 	},
+	cli.IntFlag{
+		Name:  "listeners",
+		Value: 1,
+		Usage: "bind N number of listeners per ADDRESS:PORT",
+	},
 	cli.StringFlag{
 		Name:  "console-address",
 		Usage: "bind to a specific ADDRESS:PORT for embedded Console UI, ADDRESS can be an IP or hostname",
+	},
+	cli.DurationFlag{
+		Name:   "shutdown-timeout",
+		Value:  xhttp.DefaultShutdownTimeout,
+		Usage:  "shutdown timeout to gracefully shutdown server",
+		Hidden: true,
 	},
 }
 
@@ -105,10 +116,18 @@ EXAMPLES:
 }
 
 func serverCmdArgs(ctx *cli.Context) []string {
-	v := env.Get(config.EnvArgs, "")
+	v, _, _, err := env.LookupEnv(config.EnvArgs)
+	if err != nil {
+		logger.FatalIf(err, "Unable to validate passed arguments in %s:%s",
+			config.EnvArgs, os.Getenv(config.EnvArgs))
+	}
 	if v == "" {
-		// Fall back to older ENV MINIO_ENDPOINTS
-		v = env.Get(config.EnvEndpoints, "")
+		// Fall back to older environment value MINIO_ENDPOINTS
+		v, _, _, err = env.LookupEnv(config.EnvEndpoints)
+		if err != nil {
+			logger.FatalIf(err, "Unable to validate passed arguments in %s:%s",
+				config.EnvEndpoints, os.Getenv(config.EnvEndpoints))
+		}
 	}
 	if v == "" {
 		if !ctx.Args().Present() || ctx.Args().First() == "help" {
@@ -274,7 +293,7 @@ func configRetriableErrors(err error) bool {
 		errors.Is(err, os.ErrDeadlineExceeded)
 }
 
-func initServer(ctx context.Context, newObject ObjectLayer) error {
+func initServer(ctx context.Context, newObject ObjectLayer) ([]BucketInfo, error) {
 	// Once the config is fully loaded, initialize the new object layer.
 	setObjectLayer(newObject)
 
@@ -297,7 +316,7 @@ func initServer(ctx context.Context, newObject ObjectLayer) error {
 		select {
 		case <-ctx.Done():
 			// Retry was canceled successfully.
-			return fmt.Errorf("Initializing sub-systems stopped gracefully %w", ctx.Err())
+			return nil, fmt.Errorf("Initializing sub-systems stopped gracefully %w", ctx.Err())
 		default:
 		}
 
@@ -322,14 +341,16 @@ func initServer(ctx context.Context, newObject ObjectLayer) error {
 		if err = handleEncryptedConfigBackend(newObject); err == nil {
 			// Upon success migrating the config, initialize all sub-systems
 			// if all sub-systems initialized successfully return right away
-			if err = initAllSubsystems(ctx, newObject); err == nil {
+			var buckets []BucketInfo
+			buckets, err = initConfigSubsystem(lkctx.Context(), newObject)
+			if err == nil {
 				txnLk.Unlock(lkctx.Cancel)
 				// All successful return.
 				if globalIsDistErasure {
 					// These messages only meant primarily for distributed setup, so only log during distributed setup.
 					logger.Info("All MinIO sub-systems initialized successfully")
 				}
-				return nil
+				return buckets, nil
 			}
 		}
 
@@ -343,11 +364,11 @@ func initServer(ctx context.Context, newObject ObjectLayer) error {
 		}
 
 		// Any other unhandled return right here.
-		return fmt.Errorf("Unable to initialize sub-systems: %w", err)
+		return nil, fmt.Errorf("Unable to initialize sub-systems: %w", err)
 	}
 }
 
-func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
+func initConfigSubsystem(ctx context.Context, newObject ObjectLayer) ([]BucketInfo, error) {
 	// %w is used by all error returns here to make sure
 	// we wrap the underlying error, make sure when you
 	// are modifying this code that you do so, if and when
@@ -357,7 +378,7 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 
 	buckets, err := newObject.ListBuckets(ctx)
 	if err != nil {
-		return fmt.Errorf("Unable to list buckets to heal: %w", err)
+		return nil, fmt.Errorf("Unable to list buckets to heal: %w", err)
 	}
 
 	if globalIsErasure {
@@ -371,64 +392,34 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 
 		// Limit to no more than 50 concurrent buckets.
 		g := errgroup.WithNErrs(len(buckets)).WithConcurrency(50)
-		ctx, cancel := g.WithCancelOnError(ctx)
-		defer cancel()
 		for index := range buckets {
 			index := index
 			g.Go(func() error {
-				_, berr := newObject.HealBucket(ctx, buckets[index].Name, madmin.HealOpts{Recreate: true})
-				return berr
+				_, herr := newObject.HealBucket(ctx, buckets[index].Name, madmin.HealOpts{Recreate: true})
+				return herr
 			}, index)
 		}
-		if err := g.WaitErr(); err != nil {
-			return fmt.Errorf("Unable to list buckets to heal: %w", err)
+		for _, err := range g.Wait() {
+			if err != nil {
+				return nil, fmt.Errorf("Unable to list buckets to heal: %w", err)
+			}
 		}
 	}
 
 	// Initialize config system.
 	if err = globalConfigSys.Init(newObject); err != nil {
 		if configRetriableErrors(err) {
-			return fmt.Errorf("Unable to initialize config system: %w", err)
+			return nil, fmt.Errorf("Unable to initialize config system: %w", err)
 		}
 		// Any other config errors we simply print a message and proceed forward.
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize config, some features may be missing %w", err))
 	}
 
-	// Populate existing buckets to the etcd backend
-	if globalDNSConfig != nil {
-		// Background this operation.
-		go initFederatorBackend(buckets, newObject)
-	}
-
-	// Initialize bucket metadata sub-system.
-	globalBucketMetadataSys.Init(ctx, buckets, newObject)
-
-	// Initialize notification system.
-	globalNotificationSys.Init(ctx, buckets, newObject)
-
-	// Initialize bucket targets sub-system.
-	globalBucketTargetSys.Init(ctx, buckets, newObject)
-
-	if globalIsErasure {
-		// Initialize transition tier configuration manager
-		err = globalTierConfigMgr.Init(ctx, newObject)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-type nullWriter struct{}
-
-func (lw nullWriter) Write(b []byte) (int, error) {
-	return len(b), nil
+	return buckets, nil
 }
 
 // serverMain handler called for 'minio server' command.
 func serverMain(ctx *cli.Context) {
-	defer globalDNSCache.Stop()
-
 	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 
 	go handleSignals()
@@ -492,14 +483,24 @@ func serverMain(ctx *cli.Context) {
 		getCert = globalTLSCerts.GetCertificate
 	}
 
-	httpServer := xhttp.NewServer([]string{globalMinioAddr}, criticalErrorHandler{corsHandler(handler)}, getCert)
-	httpServer.BaseContext = func(listener net.Listener) context.Context {
-		return GlobalContext
+	listeners := ctx.Int("listeners")
+	if listeners == 0 {
+		listeners = 1
 	}
-	// Turn-off random logging by Go internally
-	httpServer.ErrorLog = log.New(&nullWriter{}, "", 0)
+	addrs := make([]string, 0, listeners)
+	for i := 0; i < listeners; i++ {
+		addrs = append(addrs, globalMinioAddr)
+	}
+
+	httpServer := xhttp.NewServer(addrs).
+		UseHandler(setCriticalErrorHandler(corsHandler(handler))).
+		UseTLSConfig(newTLSConfig(getCert)).
+		UseShutdownTimeout(ctx.Duration("shutdown-timeout")).
+		UseBaseContext(GlobalContext).
+		UseCustomLogger(log.New(ioutil.Discard, "", 0)) // Turn-off random logging by Go stdlib
+
 	go func() {
-		globalHTTPServerErrorCh <- httpServer.Start()
+		globalHTTPServerErrorCh <- httpServer.Start(GlobalContext)
 	}()
 
 	setHTTPServer(httpServer)
@@ -534,7 +535,8 @@ func serverMain(ctx *cli.Context) {
 
 	initBackgroundExpiry(GlobalContext, newObject)
 
-	if err = initServer(GlobalContext, newObject); err != nil {
+	buckets, err := initServer(GlobalContext, newObject)
+	if err != nil {
 		var cerr config.Err
 		// For any config error, we don't need to drop into safe-mode
 		// instead its a user error and should be fixed by user.
@@ -550,8 +552,30 @@ func serverMain(ctx *cli.Context) {
 		logger.LogIf(GlobalContext, err)
 	}
 
+	// Populate existing buckets to the etcd backend
+	if globalDNSConfig != nil {
+		// Background this operation.
+		go initFederatorBackend(buckets, newObject)
+	}
+
+	// Initialize bucket metadata sub-system.
+	globalBucketMetadataSys.Init(GlobalContext, buckets, newObject)
+
+	// Initialize bucket notification sub-system.
+	globalNotificationSys.Init(GlobalContext, buckets, newObject)
+
+	// Initialize site replication manager.
+	globalSiteReplicationSys.Init(GlobalContext, newObject)
+
 	// Initialize users credentials and policies in background right after config has initialized.
-	go globalIAMSys.Init(GlobalContext, newObject)
+	go globalIAMSys.Init(GlobalContext, newObject, globalEtcdClient, globalNotificationSys, globalRefreshIAMInterval)
+
+	// Initialize transition tier configuration manager
+	if globalIsErasure {
+		if err := globalTierConfigMgr.Init(GlobalContext, newObject); err != nil {
+			logger.LogIf(GlobalContext, err)
+		}
+	}
 
 	initDataScanner(GlobalContext, newObject)
 
@@ -581,21 +605,32 @@ func serverMain(ctx *cli.Context) {
 		logStartupMessage(color.RedBold(msg))
 	}
 
+	if !globalCLIContext.StrictS3Compat {
+		logStartupMessage(color.RedBold("WARNING: Strict AWS S3 compatible incoming PUT, POST content payload validation is turned off, caution is advised do not use in production"))
+	}
+
 	if globalBrowserEnabled {
-		consoleSrv, err := initConsoleServer()
+		srv, err := initConsoleServer()
 		if err != nil {
 			logger.FatalIf(err, "Unable to initialize console service")
 		}
 
-		go func() {
-			logger.FatalIf(consoleSrv.Serve(), "Unable to initialize console server")
-		}()
+		setConsoleSrv(srv)
 
-		<-globalOSSignalCh
-		consoleSrv.Shutdown()
-	} else {
-		<-globalOSSignalCh
+		go func() {
+			logger.FatalIf(newConsoleServerFn().Serve(), "Unable to initialize console server")
+		}()
 	}
+
+	if serverDebugLog {
+		logger.Info("== DEBUG Mode enabled ==")
+		logger.Info("Currently set environment settings:")
+		for _, v := range os.Environ() {
+			logger.Info(v)
+		}
+		logger.Info("======")
+	}
+	<-globalOSSignalCh
 }
 
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.

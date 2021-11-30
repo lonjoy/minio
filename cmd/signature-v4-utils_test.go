@@ -18,11 +18,78 @@
 package cmd
 
 import (
+	"context"
 	"net/http"
+	"os"
 	"testing"
+	"time"
 
+	"github.com/minio/madmin-go"
+	"github.com/minio/minio/internal/auth"
 	xhttp "github.com/minio/minio/internal/http"
 )
+
+func TestCheckValid(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	objLayer, fsDir, err := prepareFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
+		t.Fatalf("unable initialize config file, %s", err)
+	}
+
+	newAllSubsystems()
+
+	initConfigSubsystem(ctx, objLayer)
+
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, globalNotificationSys, 2*time.Second)
+
+	req, err := newTestRequest(http.MethodGet, "http://example.com:9000/bucket/object", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = signRequestV4(req, globalActiveCred.AccessKey, globalActiveCred.SecretKey); err != nil {
+		t.Fatal(err)
+	}
+
+	_, owner, s3Err := checkKeyValid(req, globalActiveCred.AccessKey)
+	if s3Err != ErrNone {
+		t.Fatalf("Unexpected failure with %v", errorCodes.ToAPIErr(s3Err))
+	}
+
+	if !owner {
+		t.Fatalf("Expected owner to be 'true', found %t", owner)
+	}
+
+	_, _, s3Err = checkKeyValid(req, "does-not-exist")
+	if s3Err != ErrInvalidAccessKeyID {
+		t.Fatalf("Expected error 'ErrInvalidAccessKeyID', found %v", s3Err)
+	}
+
+	ucreds, err := auth.CreateCredentials("myuser1", "mypassword1")
+	if err != nil {
+		t.Fatalf("unable create credential, %s", err)
+	}
+
+	globalIAMSys.CreateUser(ctx, ucreds.AccessKey, madmin.UserInfo{
+		SecretKey: ucreds.SecretKey,
+		Status:    madmin.AccountEnabled,
+	})
+
+	_, owner, s3Err = checkKeyValid(req, ucreds.AccessKey)
+	if s3Err != ErrNone {
+		t.Fatalf("Unexpected failure with %v", errorCodes.ToAPIErr(s3Err))
+	}
+
+	if owner {
+		t.Fatalf("Expected owner to be 'false', found %t", owner)
+	}
+}
 
 // TestSkipContentSha256Cksum - Test validate the logic which decides whether
 // to skip checksum validation based on the request header.

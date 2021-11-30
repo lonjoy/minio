@@ -29,3 +29,8 @@ import (
 func Fdatasync(f *os.File) error {
 	return syscall.Fsync(int(f.Fd()))
 }
+
+// FadviseDontNeed is a no-op
+func FadviseDontNeed(f *os.File) error {
+	return nil
+}

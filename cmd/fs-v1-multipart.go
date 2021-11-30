@@ -340,7 +340,7 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 	partPath := pathJoin(uploadIDDir, fs.encodePartFile(partID, etag, data.ActualSize()))
 
 	// Make sure not to create parent directories if they don't exist - the upload might have been aborted.
-	if err = fsSimpleRenameFile(ctx, tmpPartPath, partPath); err != nil {
+	if err = Rename(tmpPartPath, partPath); err != nil {
 		if err == errFileNotFound || err == errFileAccessDenied {
 			return pi, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
 		}
@@ -564,9 +564,6 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		return oi, toObjectErr(err, bucket, object)
 	}
 
-	// Calculate s3 compatible md5sum for complete multipart.
-	s3MD5 := getCompleteMultipartMD5(parts)
-
 	// ensure that part ETag is canonicalized to strip off extraneous quotes
 	for i := range parts {
 		parts[i].ETag = canonicalizeETag(parts[i].ETag)
@@ -755,7 +752,12 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	if fsMeta.Meta == nil {
 		fsMeta.Meta = make(map[string]string)
 	}
-	fsMeta.Meta["etag"] = s3MD5
+
+	fsMeta.Meta["etag"] = opts.UserDefined["etag"]
+	if fsMeta.Meta["etag"] == "" {
+		fsMeta.Meta["etag"] = getCompleteMultipartMD5(parts)
+	}
+
 	// Save consolidated actual size.
 	fsMeta.Meta[ReservedMetadataPrefix+"actual-size"] = strconv.FormatInt(objectActualSize, 10)
 	if _, err = fsMeta.WriteTo(metaFile); err != nil {
@@ -774,7 +776,7 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		fsTmpObjPath := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID, mustGetUUID())
 		defer fsRemoveAll(ctx, fsTmpObjPath) // remove multipart temporary files in background.
 
-		fsSimpleRenameFile(ctx, uploadIDDir, fsTmpObjPath)
+		Rename(uploadIDDir, fsTmpObjPath)
 
 		// It is safe to ignore any directory not empty error (in case there were multiple uploadIDs on the same object)
 		fsRemoveDir(ctx, fs.getMultipartSHADir(bucket, object))
@@ -833,7 +835,7 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 		fsTmpObjPath := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID, mustGetUUID())
 		defer fsRemoveAll(ctx, fsTmpObjPath) // remove multipart temporary files in background.
 
-		fsSimpleRenameFile(ctx, uploadIDDir, fsTmpObjPath)
+		Rename(uploadIDDir, fsTmpObjPath)
 
 		// It is safe to ignore any directory not empty error (in case there were multiple uploadIDs on the same object)
 		fsRemoveDir(ctx, fs.getMultipartSHADir(bucket, object))
@@ -845,8 +847,8 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 // Removes multipart uploads if any older than `expiry` duration
 // on all buckets for every `cleanupInterval`, this function is
 // blocking and should be run in a go-routine.
-func (fs *FSObjects) cleanupStaleUploads(ctx context.Context, cleanupInterval, expiry time.Duration) {
-	timer := time.NewTimer(cleanupInterval)
+func (fs *FSObjects) cleanupStaleUploads(ctx context.Context) {
+	timer := time.NewTimer(globalAPIConfig.getStaleUploadsCleanupInterval())
 	defer timer.Stop()
 
 	for {
@@ -855,7 +857,9 @@ func (fs *FSObjects) cleanupStaleUploads(ctx context.Context, cleanupInterval, e
 			return
 		case <-timer.C:
 			// Reset for the next interval
-			timer.Reset(cleanupInterval)
+			timer.Reset(globalAPIConfig.getStaleUploadsCleanupInterval())
+
+			expiry := globalAPIConfig.getStaleUploadsExpiry()
 
 			now := time.Now()
 			entries, err := readDir(pathJoin(fs.fsPath, minioMetaMultipartBucket))

@@ -24,8 +24,10 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/logger"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -69,6 +71,7 @@ const (
 	sysCallSubsystem          MetricSubsystem = "syscall"
 	usageSubsystem            MetricSubsystem = "usage"
 	ilmSubsystem              MetricSubsystem = "ilm"
+	scannerSubsystem          MetricSubsystem = "scanner"
 )
 
 // MetricName are the individual names for the metric.
@@ -96,17 +99,18 @@ const (
 	total          MetricName = "total"
 	freeInodes     MetricName = "free_inodes"
 
-	failedCount   MetricName = "failed_count"
-	failedBytes   MetricName = "failed_bytes"
-	freeBytes     MetricName = "free_bytes"
-	readBytes     MetricName = "read_bytes"
-	rcharBytes    MetricName = "rchar_bytes"
-	receivedBytes MetricName = "received_bytes"
-	sentBytes     MetricName = "sent_bytes"
-	totalBytes    MetricName = "total_bytes"
-	usedBytes     MetricName = "used_bytes"
-	writeBytes    MetricName = "write_bytes"
-	wcharBytes    MetricName = "wchar_bytes"
+	failedCount     MetricName = "failed_count"
+	failedBytes     MetricName = "failed_bytes"
+	freeBytes       MetricName = "free_bytes"
+	readBytes       MetricName = "read_bytes"
+	rcharBytes      MetricName = "rchar_bytes"
+	receivedBytes   MetricName = "received_bytes"
+	latencyMilliSec MetricName = "latency_ms"
+	sentBytes       MetricName = "sent_bytes"
+	totalBytes      MetricName = "total_bytes"
+	usedBytes       MetricName = "used_bytes"
+	writeBytes      MetricName = "write_bytes"
+	wcharBytes      MetricName = "wchar_bytes"
 
 	usagePercent MetricName = "update_percent"
 
@@ -255,6 +259,7 @@ func GetGeneratorsForPeer() []MetricsGenerator {
 		getNetworkMetrics,
 		getS3TTFBMetric,
 		getILMNodeMetrics,
+		getScannerNodeMetrics,
 	}
 	return g
 }
@@ -402,6 +407,16 @@ func getBucketUsageObjectsTotalMD() MetricDescription {
 		Name:      objectTotal,
 		Help:      "Total number of objects",
 		Type:      gaugeMetric,
+	}
+}
+
+func getBucketRepLatencyMD() MetricDescription {
+	return MetricDescription{
+		Namespace: bucketMetricNamespace,
+		Subsystem: replicationSubsystem,
+		Name:      latencyMilliSec,
+		Help:      "Replication latency in milliseconds.",
+		Type:      histogramMetric,
 	}
 }
 
@@ -1066,6 +1081,95 @@ func getILMNodeMetrics() MetricsGroup {
 	}
 }
 
+func getScannerNodeMetrics() MetricsGroup {
+	return MetricsGroup{
+		id:         "ScannerNodeMetrics",
+		cachedRead: cachedRead,
+		read: func(_ context.Context) []Metric {
+			metrics := []Metric{
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "objects_scanned",
+						Help:      "Total number of unique objects scanned since server start.",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.accTotalObjects)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "versions_scanned",
+						Help:      "Total number of object versions scanned since server start.",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.accTotalVersions)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "directories_scanned",
+						Help:      "Total number of directories scanned since server start.",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.accFolders)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "bucket_scans_started",
+						Help:      "Total number of bucket scans started since server start",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.bucketsStarted)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "bucket_scans_finished",
+						Help:      "Total number of bucket scans finished since server start",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.bucketsFinished)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: ilmSubsystem,
+						Name:      "versions_scanned",
+						Help:      "Total number of object versions checked for ilm actions since server start",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.ilmChecks)),
+				},
+			}
+			for i := range globalScannerStats.actions {
+				action := lifecycle.Action(i)
+				v := atomic.LoadUint64(&globalScannerStats.actions[action])
+				if v == 0 {
+					continue
+				}
+				metrics = append(metrics, Metric{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: ilmSubsystem,
+						Name:      MetricName("action_count_" + toSnake(action.String())),
+						Help:      "Total action outcome of lifecycle checks since server start",
+						Type:      counterMetric,
+					},
+					Value: float64(v),
+				})
+			}
+			return metrics
+		},
+	}
+}
+
 func getMinioVersionMetrics() MetricsGroup {
 	return MetricsGroup{
 		id:         "MinioVersionMetrics",
@@ -1352,7 +1456,7 @@ func getBucketUsageMetrics() MetricsGroup {
 			})
 
 			for bucket, usage := range dataUsageInfo.BucketsUsage {
-				stat := getLatestReplicationStats(bucket, usage)
+				stats := getLatestReplicationStats(bucket, usage)
 
 				metrics = append(metrics, Metric{
 					Description:    getBucketUsageTotalBytesMD(),
@@ -1366,27 +1470,37 @@ func getBucketUsageMetrics() MetricsGroup {
 					VariableLabels: map[string]string{"bucket": bucket},
 				})
 
-				if stat.hasReplicationUsage() {
-					metrics = append(metrics, Metric{
-						Description:    getBucketRepFailedBytesMD(),
-						Value:          float64(stat.FailedSize),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
-					metrics = append(metrics, Metric{
-						Description:    getBucketRepSentBytesMD(),
-						Value:          float64(stat.ReplicatedSize),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
-					metrics = append(metrics, Metric{
-						Description:    getBucketRepReceivedBytesMD(),
-						Value:          float64(stat.ReplicaSize),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
-					metrics = append(metrics, Metric{
-						Description:    getBucketRepFailedOperationsMD(),
-						Value:          float64(stat.FailedCount),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
+				metrics = append(metrics, Metric{
+					Description:    getBucketRepReceivedBytesMD(),
+					Value:          float64(stats.ReplicaSize),
+					VariableLabels: map[string]string{"bucket": bucket},
+				})
+
+				if stats.hasReplicationUsage() {
+					for arn, stat := range stats.Stats {
+						metrics = append(metrics, Metric{
+							Description:    getBucketRepFailedBytesMD(),
+							Value:          float64(stat.FailedSize),
+							VariableLabels: map[string]string{"bucket": bucket, "targetArn": arn},
+						})
+						metrics = append(metrics, Metric{
+							Description:    getBucketRepSentBytesMD(),
+							Value:          float64(stat.ReplicatedSize),
+							VariableLabels: map[string]string{"bucket": bucket, "targetArn": arn},
+						})
+						metrics = append(metrics, Metric{
+							Description:    getBucketRepFailedOperationsMD(),
+							Value:          float64(stat.FailedCount),
+							VariableLabels: map[string]string{"bucket": bucket, "targetArn": arn},
+						})
+						metrics = append(metrics, Metric{
+							Description:          getBucketRepLatencyMD(),
+							HistogramBucketLabel: "range",
+							Histogram:            stat.Latency.getUploadLatency(),
+							VariableLabels:       map[string]string{"bucket": bucket, "operation": "upload", "targetArn": arn},
+						})
+
+					}
 				}
 
 				metrics = append(metrics, Metric{
@@ -1527,20 +1641,18 @@ func (c *minioClusterCollector) Collect(out chan<- prometheus.Metric) {
 					continue
 				}
 				for k, v := range metric.Histogram {
-					l := append(labels, metric.HistogramBucketLabel)
-					lv := append(values, k)
 					out <- prometheus.MustNewConstMetric(
 						prometheus.NewDesc(
 							prometheus.BuildFQName(string(metric.Description.Namespace),
 								string(metric.Description.Subsystem),
 								string(metric.Description.Name)),
 							metric.Description.Help,
-							l,
+							append(labels, metric.HistogramBucketLabel),
 							metric.StaticLabels,
 						),
 						prometheus.GaugeValue,
 						float64(v),
-						lv...)
+						append(values, k)...)
 				}
 				continue
 			}
@@ -1750,4 +1862,27 @@ func metricsNodeHandler() http.Handler {
 				ErrorHandling: promhttp.ContinueOnError,
 			}),
 	)
+}
+
+func toSnake(camel string) (snake string) {
+	var b strings.Builder
+	l := len(camel)
+	for i, v := range camel {
+		// A is 65, a is 97
+		if v >= 'a' {
+			b.WriteRune(v)
+			continue
+		}
+		// v is capital letter here
+		// disregard first letter
+		// add underscore if last letter is capital letter
+		// add underscore when previous letter is lowercase
+		// add underscore when next letter is lowercase
+		if (i != 0 || i == l-1) && ((i > 0 && rune(camel[i-1]) >= 'a') ||
+			(i < l-1 && rune(camel[i+1]) >= 'a')) {
+			b.WriteRune('_')
+		}
+		b.WriteRune(v + 'a' - 'A')
+	}
+	return b.String()
 }

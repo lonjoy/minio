@@ -18,7 +18,7 @@
 package cmd
 
 const (
-	storageRESTVersion       = "v39" // Add FileInfo.Fresh field
+	storageRESTVersion       = "v42" // Added FreeVersions to FileInfoVersions
 	storageRESTVersionPrefix = SlashSeparator + storageRESTVersion
 	storageRESTPrefix        = minioReservedBucketPath + "/storage"
 )
@@ -78,4 +78,5 @@ const (
 	storageRESTBitrotHash     = "bitrot-hash"
 	storageRESTDiskID         = "disk-id"
 	storageRESTForceDelete    = "force-delete"
+	storageRESTGlob           = "glob"
 )

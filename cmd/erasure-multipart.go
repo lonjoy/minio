@@ -67,10 +67,10 @@ func (er erasureObjects) checkUploadIDExists(ctx context.Context, bucket, object
 	}
 
 	// List all online disks.
-	_, modTime, dataDir := listOnlineDisks(disks, metaArr, errs)
+	_, modTime := listOnlineDisks(disks, metaArr, errs)
 
 	// Pick latest valid metadata.
-	_, err = pickValidFileInfo(ctx, metaArr, modTime, dataDir, readQuorum)
+	_, err = pickValidFileInfo(ctx, metaArr, modTime, readQuorum)
 	return err
 }
 
@@ -460,10 +460,10 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	}
 
 	// List all online disks.
-	onlineDisks, modTime, dataDir := listOnlineDisks(storageDisks, partsMetadata, errs)
+	onlineDisks, modTime := listOnlineDisks(storageDisks, partsMetadata, errs)
 
 	// Pick one from the first valid metadata.
-	fi, err := pickValidFileInfo(pctx, partsMetadata, modTime, dataDir, writeQuorum)
+	fi, err := pickValidFileInfo(pctx, partsMetadata, modTime, writeQuorum)
 	if err != nil {
 		return pi, err
 	}
@@ -568,10 +568,10 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	}
 
 	// Get current highest version based on re-read partsMetadata.
-	onlineDisks, modTime, dataDir = listOnlineDisks(onlineDisks, partsMetadata, errs)
+	onlineDisks, modTime = listOnlineDisks(onlineDisks, partsMetadata, errs)
 
 	// Pick one from the first valid metadata.
-	fi, err = pickValidFileInfo(wctx, partsMetadata, modTime, dataDir, writeQuorum)
+	fi, err = pickValidFileInfo(wctx, partsMetadata, modTime, writeQuorum)
 	if err != nil {
 		return pi, err
 	}
@@ -656,10 +656,10 @@ func (er erasureObjects) GetMultipartInfo(ctx context.Context, bucket, object, u
 		return result, toObjectErr(reducedErr, minioMetaMultipartBucket, uploadIDPath)
 	}
 
-	_, modTime, dataDir := listOnlineDisks(storageDisks, partsMetadata, errs)
+	_, modTime := listOnlineDisks(storageDisks, partsMetadata, errs)
 
 	// Pick one from the first valid metadata.
-	fi, err := pickValidFileInfo(ctx, partsMetadata, modTime, dataDir, readQuorum)
+	fi, err := pickValidFileInfo(ctx, partsMetadata, modTime, readQuorum)
 	if err != nil {
 		return result, err
 	}
@@ -706,10 +706,10 @@ func (er erasureObjects) ListObjectParts(ctx context.Context, bucket, object, up
 		return result, toObjectErr(reducedErr, minioMetaMultipartBucket, uploadIDPath)
 	}
 
-	_, modTime, dataDir := listOnlineDisks(storageDisks, partsMetadata, errs)
+	_, modTime := listOnlineDisks(storageDisks, partsMetadata, errs)
 
 	// Pick one from the first valid metadata.
-	fi, err := pickValidFileInfo(ctx, partsMetadata, modTime, dataDir, writeQuorum)
+	fi, err := pickValidFileInfo(ctx, partsMetadata, modTime, writeQuorum)
 	if err != nil {
 		return result, err
 	}
@@ -783,9 +783,6 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		return oi, toObjectErr(err, bucket, object, uploadID)
 	}
 
-	// Calculate s3 compatible md5sum for complete multipart.
-	s3MD5 := getCompleteMultipartMD5(parts)
-
 	uploadIDPath := er.getUploadIDDir(bucket, object, uploadID)
 
 	storageDisks := er.getDisks()
@@ -804,10 +801,10 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		return oi, toObjectErr(reducedErr, bucket, object)
 	}
 
-	onlineDisks, modTime, dataDir := listOnlineDisks(storageDisks, partsMetadata, errs)
+	onlineDisks, modTime := listOnlineDisks(storageDisks, partsMetadata, errs)
 
 	// Pick one from the first valid metadata.
-	fi, err := pickValidFileInfo(rctx, partsMetadata, modTime, dataDir, writeQuorum)
+	fi, err := pickValidFileInfo(rctx, partsMetadata, modTime, writeQuorum)
 	if err != nil {
 		return oi, err
 	}
@@ -882,9 +879,9 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 	}
 
 	// Save successfully calculated md5sum.
-	fi.Metadata["etag"] = s3MD5
-	if opts.UserDefined["etag"] != "" { // preserve ETag if set
-		fi.Metadata["etag"] = opts.UserDefined["etag"]
+	fi.Metadata["etag"] = opts.UserDefined["etag"]
+	if fi.Metadata["etag"] == "" {
+		fi.Metadata["etag"] = getCompleteMultipartMD5(parts)
 	}
 
 	// Save the consolidated actual size.
@@ -952,6 +949,9 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 			break
 		}
 	}
+
+	// we are adding a new version to this object under the namespace lock, so this is the latest version.
+	fi.IsLatest = true
 
 	// Success, return object info.
 	return fi.ToObjectInfo(bucket, object), nil

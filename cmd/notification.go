@@ -63,7 +63,7 @@ func (sys *NotificationSys) GetARNList(onlyActive bool) []string {
 	if sys == nil {
 		return arns
 	}
-	region := globalServerRegion
+	region := globalSite.Region
 	for targetID, target := range sys.targetList.TargetMap() {
 		// httpclient target is part of ListenNotification
 		// which doesn't need to be listed as part of the ARN list
@@ -536,6 +536,10 @@ func (sys *NotificationSys) GetLocks(ctx context.Context, r *http.Request) []*Pe
 
 // LoadBucketMetadata - calls LoadBucketMetadata call on all peers
 func (sys *NotificationSys) LoadBucketMetadata(ctx context.Context, bucketName string) {
+	if globalIsGateway {
+		return
+	}
+
 	ng := WithNPeers(len(sys.peerClients))
 	for idx, client := range sys.peerClients {
 		if client == nil {
@@ -634,23 +638,18 @@ func (sys *NotificationSys) LoadTransitionTierConfig(ctx context.Context) {
 }
 
 // Loads notification policies for all buckets into NotificationSys.
-func (sys *NotificationSys) load(buckets []BucketInfo) {
-	for _, bucket := range buckets {
-		ctx := logger.SetReqInfo(GlobalContext, &logger.ReqInfo{BucketName: bucket.Name})
-		config, err := globalBucketMetadataSys.GetNotificationConfig(bucket.Name)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			continue
-		}
-		config.SetRegion(globalServerRegion)
-		if err = config.Validate(globalServerRegion, globalNotificationSys.targetList); err != nil {
-			if _, ok := err.(*event.ErrARNNotFound); !ok {
-				logger.LogIf(ctx, err)
-			}
-			continue
-		}
-		sys.AddRulesMap(bucket.Name, config.ToRulesMap())
+func (sys *NotificationSys) set(bucket BucketInfo, meta BucketMetadata) {
+	config := meta.notificationConfig
+	if config == nil {
+		return
 	}
+	config.SetRegion(globalSite.Region)
+	if err := config.Validate(globalSite.Region, globalNotificationSys.targetList); err != nil {
+		if _, ok := err.(*event.ErrARNNotFound); !ok {
+			logger.LogIf(GlobalContext, err)
+		}
+	}
+	sys.AddRulesMap(bucket.Name, config.ToRulesMap())
 }
 
 // Init - initializes notification system from notification.xml and listenxl.meta of all buckets.
@@ -676,7 +675,6 @@ func (sys *NotificationSys) Init(ctx context.Context, buckets []BucketInfo, objA
 		}
 	}()
 
-	go sys.load(buckets)
 	return nil
 }
 
@@ -1065,6 +1063,32 @@ func (sys *NotificationSys) GetOSInfo(ctx context.Context) []madmin.OSInfo {
 	return reply
 }
 
+// GetSysConfig - Get information about system config
+// (only the config that are of concern to minio)
+func (sys *NotificationSys) GetSysConfig(ctx context.Context) []madmin.SysConfig {
+	reply := make([]madmin.SysConfig, len(sys.peerClients))
+
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			var err error
+			reply[index], err = sys.peerClients[index].GetSysConfig(ctx)
+			return err
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		if err != nil {
+			sys.addNodeErr(&reply[index], sys.peerClients[index], err)
+		}
+	}
+	return reply
+}
+
 // GetSysServices - Get information about system services
 // (only the services that are of concern to minio)
 func (sys *NotificationSys) GetSysServices(ctx context.Context) []madmin.SysServices {
@@ -1305,8 +1329,13 @@ func (args eventArgs) ToEvent(escape bool) event.Event {
 	uniqueID := fmt.Sprintf("%X", eventTime.UnixNano())
 
 	respElements := map[string]string{
-		"x-amz-request-id":        args.RespElements["requestId"],
-		"x-minio-origin-endpoint": globalMinioEndpoint, // MinIO specific custom elements.
+		"x-amz-request-id": args.RespElements["requestId"],
+		"x-minio-origin-endpoint": func() string {
+			if globalMinioEndpoint != "" {
+				return globalMinioEndpoint
+			}
+			return getAPIEndpoints()[0]
+		}(), // MinIO specific custom elements.
 	}
 	// Add deployment as part of
 	if globalDeploymentID != "" {
@@ -1352,7 +1381,13 @@ func (args eventArgs) ToEvent(escape bool) event.Event {
 		newEvent.S3.Object.ETag = args.Object.ETag
 		newEvent.S3.Object.Size = args.Object.Size
 		newEvent.S3.Object.ContentType = args.Object.ContentType
-		newEvent.S3.Object.UserMetadata = args.Object.UserDefined
+		newEvent.S3.Object.UserMetadata = make(map[string]string, len(args.Object.UserDefined))
+		for k, v := range args.Object.UserDefined {
+			if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+				continue
+			}
+			newEvent.S3.Object.UserMetadata[k] = v
+		}
 	}
 
 	return newEvent
@@ -1454,6 +1489,9 @@ func (sys *NotificationSys) GetBandwidthReports(ctx context.Context, buckets ...
 
 // GetClusterMetrics - gets the cluster metrics from all nodes excluding self.
 func (sys *NotificationSys) GetClusterMetrics(ctx context.Context) chan Metric {
+	if sys == nil {
+		return nil
+	}
 	g := errgroup.WithNErrs(len(sys.peerClients))
 	peerChannels := make([]<-chan Metric, len(sys.peerClients))
 	for index := range sys.peerClients {
@@ -1501,10 +1539,47 @@ func (sys *NotificationSys) GetClusterMetrics(ctx context.Context) chan Metric {
 	return ch
 }
 
+// ServiceFreeze freezes all S3 API calls when 'freeze' is true,
+// 'freeze' is 'false' would resume all S3 API calls again.
+// NOTE: once a tenant is frozen either two things needs to
+// happen before resuming normal operations.
+// - Server needs to be restarted 'mc admin service restart'
+// - 'freeze' should be set to 'false' for this call
+//   to resume normal operations.
+func (sys *NotificationSys) ServiceFreeze(ctx context.Context, freeze bool) []NotificationPeerErr {
+	serviceSig := serviceUnFreeze
+	if freeze {
+		serviceSig = serviceFreeze
+	}
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(GlobalContext, func() error {
+			return client.SignalService(serviceSig)
+		}, idx, *client.host)
+	}
+	nerrs := ng.Wait()
+	if freeze {
+		freezeServices()
+	} else {
+		unfreezeServices()
+	}
+	return nerrs
+}
+
 // Speedtest run GET/PUT tests at input concurrency for requested object size,
 // optionally you can extend the tests longer with time.Duration.
-func (sys *NotificationSys) Speedtest(ctx context.Context, size int, concurrent int, duration time.Duration) []madmin.SpeedtestResult {
-	results := make([]madmin.SpeedtestResult, len(sys.allPeerClients))
+func (sys *NotificationSys) Speedtest(ctx context.Context, size int,
+	concurrent int, duration time.Duration, storageClass string) []SpeedtestResult {
+	length := len(sys.allPeerClients)
+	if length == 0 {
+		// For single node erasure setup.
+		length = 1
+	}
+	results := make([]SpeedtestResult, length)
 
 	scheme := "http"
 	if globalIsTLS {
@@ -1519,36 +1594,57 @@ func (sys *NotificationSys) Speedtest(ctx context.Context, size int, concurrent 
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
-			r, err := sys.peerClients[index].Speedtest(ctx, size, concurrent, duration)
+			r, err := sys.peerClients[index].Speedtest(ctx, size,
+				concurrent, duration, storageClass)
 			u := &url.URL{
 				Scheme: scheme,
 				Host:   sys.peerClients[index].host.String(),
 			}
-			results[index].Endpoint = u.String()
-			results[index].Err = err
-			if err == nil {
-				results[index].Uploads = r.Uploads
-				results[index].Downloads = r.Downloads
+			if err != nil {
+				results[index].Error = err.Error()
+			} else {
+				results[index] = r
 			}
+			results[index].Endpoint = u.String()
 		}(index)
 	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		r, err := selfSpeedtest(ctx, size, concurrent, duration)
+		r, err := selfSpeedtest(ctx, size, concurrent, duration, storageClass)
 		u := &url.URL{
 			Scheme: scheme,
 			Host:   globalLocalNodeName,
 		}
-		results[len(results)-1].Endpoint = u.String()
-		results[len(results)-1].Err = err
-		if err == nil {
-			results[len(results)-1].Uploads = r.Uploads
-			results[len(results)-1].Downloads = r.Downloads
+		if err != nil {
+			results[len(results)-1].Error = err.Error()
+		} else {
+			results[len(results)-1] = r
 		}
+		results[len(results)-1].Endpoint = u.String()
 	}()
 	wg.Wait()
 
 	return results
+}
+
+// ReloadSiteReplicationConfig - tells all peer minio nodes to reload the
+// site-replication configuration.
+func (sys *NotificationSys) ReloadSiteReplicationConfig(ctx context.Context) []error {
+	errs := make([]error, len(sys.allPeerClients))
+	var wg sync.WaitGroup
+	for index := range sys.peerClients {
+		if sys.peerClients[index] == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			errs[index] = sys.peerClients[index].ReloadSiteReplicationConfig(ctx)
+		}(index)
+	}
+
+	wg.Wait()
+	return errs
 }

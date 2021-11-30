@@ -98,7 +98,7 @@ func (h *Target) Init() error {
 	// Drain any response.
 	xhttp.DrainBody(resp.Body)
 
-	if resp.StatusCode != http.StatusOK {
+	if !acceptedResponseStatusCode(resp.StatusCode) {
 		switch resp.StatusCode {
 		case http.StatusForbidden:
 			return fmt.Errorf("%s returned '%s', please check if your auth token is correctly set",
@@ -110,6 +110,13 @@ func (h *Target) Init() error {
 
 	go h.startHTTPLogger()
 	return nil
+}
+
+// Accepted HTTP Status Codes
+var acceptedStatusCodeMap = map[int]bool{http.StatusOK: true, http.StatusCreated: true, http.StatusAccepted: true, http.StatusNoContent: true}
+
+func acceptedResponseStatusCode(code int) bool {
+	return acceptedStatusCodeMap[code]
 }
 
 func (h *Target) startHTTPLogger() {
@@ -150,7 +157,7 @@ func (h *Target) startHTTPLogger() {
 			// Drain any response.
 			xhttp.DrainBody(resp.Body)
 
-			if resp.StatusCode != http.StatusOK {
+			if !acceptedResponseStatusCode(resp.StatusCode) {
 				switch resp.StatusCode {
 				case http.StatusForbidden:
 					h.config.LogOnce(ctx, fmt.Errorf("%s returned '%s', please check if your auth token is correctly set", h.config.Endpoint, resp.Status), h.config.Endpoint)

@@ -18,14 +18,13 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"errors"
+	"io"
 	"net/http"
-	"sort"
-	"strconv"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
 	"github.com/minio/minio/internal/dsync"
 )
@@ -35,7 +34,7 @@ const (
 	lockMaintenanceInterval = 1 * time.Minute
 
 	// Lock validity duration
-	lockValidityDuration = 20 * time.Second
+	lockValidityDuration = 1 * time.Minute
 )
 
 // To abstract a node over network.
@@ -63,32 +62,10 @@ func (l *lockRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func getLockArgs(r *http.Request) (args dsync.LockArgs, err error) {
-	values := r.Form
-	quorum, err := strconv.Atoi(values.Get(lockRESTQuorum))
-	if err != nil {
-		return args, err
-	}
-
-	args = dsync.LockArgs{
-		Owner:  values.Get(lockRESTOwner),
-		UID:    values.Get(lockRESTUID),
-		Source: values.Get(lockRESTSource),
-		Quorum: quorum,
-	}
-
-	var resources []string
-	bio := bufio.NewScanner(r.Body)
-	for bio.Scan() {
-		resources = append(resources, bio.Text())
-	}
-
-	if err := bio.Err(); err != nil {
-		return args, err
-	}
-
-	sort.Strings(resources)
-	args.Resources = resources
-	return args, nil
+	dec := msgpNewReader(io.LimitReader(r.Body, 1000*humanize.KiByte))
+	defer readMsgpReaderPool.Put(dec)
+	err = args.DecodeMsg(dec)
+	return args, err
 }
 
 // HealthHandler returns success if request is authenticated.

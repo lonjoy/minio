@@ -8,6 +8,7 @@ apiVersion: {{ template "minio.deployment.apiVersion" . }}
 kind: Deployment
 metadata:
   name: {{ template "minio.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
   labels:
     app: {{ template "minio.name" . }}
     chart: {{ template "minio.chart" . }}
@@ -65,7 +66,7 @@ spec:
           command:
             - "/bin/sh"
             - "-ce"
-            - "/usr/bin/docker-entrypoint.sh minio -S {{ .Values.certsPath }} server --address :{{ .Values.minioAPIPort }} --console-address :{{ .Values.minioConsolePort }} {{ $bucketRoot }} {{- template "minio.extraArgs" . }}"
+            - "/usr/bin/docker-entrypoint.sh minio server {{ $bucketRoot }} -S {{ .Values.certsPath }} --address :{{ .Values.minioAPIPort }} --console-address :{{ .Values.minioConsolePort }} {{- template "minio.extraArgs" . }}"
           volumeMounts:
             {{- if .Values.persistence.enabled }}
             - name: export
@@ -91,6 +92,10 @@ spec:
                 secretKeyRef:
                   name: {{ template "minio.secretName" . }}
                   key: rootPassword
+            {{- if .Values.metrics.serviceMonitor.public }}
+            - name: MINIO_PROMETHEUS_AUTH_TYPE
+              value: "public"
+            {{- end}}
             {{- range $key, $val := .Values.environment }}
             - name: {{ $key }}
               value: {{ $val | quote }}

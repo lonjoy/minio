@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/console"
 )
 
@@ -104,18 +105,21 @@ func resolveEntries(a, b *metaCacheEntry, bucket string) *metaCacheEntry {
 		return a
 	}
 
-	if !aFi.ModTime.Equal(bFi.ModTime) {
+	if aFi.NumVersions == bFi.NumVersions {
+		if aFi.ModTime.Equal(bFi.ModTime) {
+			return a
+		}
 		if aFi.ModTime.After(bFi.ModTime) {
 			return a
 		}
 		return b
 	}
 
-	if aFi.NumVersions > bFi.NumVersions {
-		return a
+	if bFi.NumVersions > aFi.NumVersions {
+		return b
 	}
 
-	return b
+	return a
 }
 
 // isInDir returns whether the entry is in the dir when considering the separator.
@@ -144,11 +148,15 @@ func (e *metaCacheEntry) isLatestDeletemarker() bool {
 	if !isXL2V1Format(e.metadata) {
 		return false
 	}
+	if meta, _ := isIndexedMetaV2(e.metadata); meta != nil {
+		return meta.IsLatestDeleteMarker()
+	}
+	// Fall back...
 	var xlMeta xlMetaV2
-	if err := xlMeta.Load(e.metadata); err != nil || len(xlMeta.Versions) == 0 {
+	if err := xlMeta.Load(e.metadata); err != nil || len(xlMeta.versions) == 0 {
 		return true
 	}
-	return xlMeta.Versions[len(xlMeta.Versions)-1].Type == DeleteType
+	return xlMeta.versions[0].header.Type == DeleteType
 }
 
 // fileInfo returns the decoded metadata.
@@ -163,6 +171,10 @@ func (e *metaCacheEntry) fileInfo(bucket string) (*FileInfo, error) {
 		}, nil
 	}
 	if e.cached == nil {
+		if len(e.metadata) == 0 {
+			// only happens if the entry is not found.
+			return nil, errFileNotFound
+		}
 		fi, err := getFileInfo(e.metadata, bucket, e.name, "", false)
 		if err != nil {
 			return nil, err
@@ -250,7 +262,7 @@ func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCa
 			e *metaCacheEntry
 		}, 0, len(m))
 	}
-	r.candidates = r.candidates[0:]
+	r.candidates = r.candidates[:0]
 	for i := range m {
 		entry := &m[i]
 		if entry.name == "" {
@@ -265,6 +277,7 @@ func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCa
 
 		// Get new entry metadata
 		if _, err := entry.fileInfo(r.bucket); err != nil {
+			logger.LogIf(context.Background(), err)
 			continue
 		}
 
@@ -308,15 +321,25 @@ func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCa
 		sort.Slice(r.candidates, func(i, j int) bool {
 			return r.candidates[i].n > r.candidates[j].n
 		})
+
 		// Check if we have enough.
 		if r.candidates[0].n < r.objQuorum {
 			return nil, false
 		}
-		if r.candidates[0].n > r.candidates[1].n {
-			return r.candidates[0].e, true
+
+		// if r.objQuorum == 1 then it is guaranteed that
+		// this resolver is for HealObjects(), so use resolveEntries()
+		// instead to resolve candidates, this check is only useful
+		// for regular cases of ListObjects()
+		if r.candidates[0].n > r.candidates[1].n && r.objQuorum > 1 {
+			ok := r.candidates[0].e != nil && r.candidates[0].e.name != ""
+			return r.candidates[0].e, ok
 		}
+
+		e := resolveEntries(r.candidates[0].e, r.candidates[1].e, r.bucket)
 		// Tie between two, resolve using modtime+versions.
-		return resolveEntries(r.candidates[0].e, r.candidates[1].e, r.bucket), true
+		ok := e != nil && e.name != ""
+		return e, ok
 	}
 }
 
@@ -601,11 +624,9 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 					}
 					best = other
 					bestIdx = otherIdx
-				} else {
+				} else if err := selectFrom(otherIdx); err != nil {
 					// Keep best, replace "other"
-					if err := selectFrom(otherIdx); err != nil {
-						return err
-					}
+					return err
 				}
 				continue
 			}
@@ -617,10 +638,8 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 		if best.name > last {
 			out <- *best
 			last = best.name
-		} else {
-			if serverDebugLog {
-				console.Debugln("mergeEntryChannels: discarding duplicate", best.name, "<=", last)
-			}
+		} else if serverDebugLog {
+			console.Debugln("mergeEntryChannels: discarding duplicate", best.name, "<=", last)
 		}
 		// Replace entry we just sent.
 		if err := selectFrom(bestIdx); err != nil {

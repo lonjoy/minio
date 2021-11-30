@@ -287,7 +287,7 @@ func ErrorRespToObjectError(err error, params ...string) error {
 	}
 
 	if xnet.IsNetworkOrHostDown(err, false) {
-		return BackendDown{}
+		return BackendDown{Err: err.Error()}
 	}
 
 	minioErr, ok := err.(minio.ErrorResponse)
@@ -388,7 +388,7 @@ func gatewayHandleEnvVars() {
 
 // shouldMeterRequest checks whether incoming request should be added to prometheus gateway metrics
 func shouldMeterRequest(req *http.Request) bool {
-	return !(guessIsBrowserReq(req) || guessIsHealthCheckReq(req) || guessIsMetricsReq(req))
+	return req.URL != nil && !strings.HasPrefix(req.URL.Path, minioReservedBucketPath+slashSeparator)
 }
 
 // MetricsTransport is a custom wrapper around Transport to track metrics

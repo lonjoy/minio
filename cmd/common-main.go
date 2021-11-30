@@ -38,6 +38,7 @@ import (
 
 	fcolor "github.com/fatih/color"
 	"github.com/go-openapi/loads"
+	"github.com/inconshreveable/mousetrap"
 	dns2 "github.com/miekg/dns"
 	"github.com/minio/cli"
 	consoleCerts "github.com/minio/console/pkg/certs"
@@ -51,7 +52,6 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/handlers"
-	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/certs"
@@ -59,6 +59,7 @@ import (
 	"github.com/minio/pkg/ellipses"
 	"github.com/minio/pkg/env"
 	xnet "github.com/minio/pkg/net"
+	"github.com/rs/dnscache"
 )
 
 // serverDebugLog will enable debug printing
@@ -66,21 +67,49 @@ var serverDebugLog = env.Get("_MINIO_SERVER_DEBUG", config.EnableOff) == config.
 var defaultAWSCredProvider []credentials.Provider
 
 func init() {
+	if runtime.GOOS == "windows" {
+		if mousetrap.StartedByExplorer() {
+			fmt.Printf("Don't double-click %s\n", os.Args[0])
+			fmt.Println("You need to open cmd.exe/PowerShell and run it from the command line")
+			fmt.Println("Refer to the docs here on how to run it as a Windows Service https://github.com/minio/minio-service/tree/master/windows")
+			fmt.Println("Press the Enter Key to Exit")
+			fmt.Scanln()
+			os.Exit(1)
+		}
+	}
+
 	rand.Seed(time.Now().UTC().UnixNano())
 
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
 
-	if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsPCFTile() {
-		// 30 seconds matches the orchestrator DNS TTLs, have
-		// a 5 second timeout to lookup from DNS servers.
-		globalDNSCache = xhttp.NewDNSCache(30*time.Second, 5*time.Second, logger.LogOnceIf)
-	} else {
-		// On bare-metals DNS do not change often, so it is
-		// safe to assume a higher timeout upto 10 minutes.
-		globalDNSCache = xhttp.NewDNSCache(10*time.Minute, 5*time.Second, logger.LogOnceIf)
-	}
 	initGlobalContext()
+
+	options := dnscache.ResolverRefreshOptions{
+		ClearUnused:      true,
+		PersistOnFailure: false,
+	}
+
+	// Call to refresh will refresh names in cache. If you pass true, it will also
+	// remove cached names not looked up since the last call to Refresh. It is a good idea
+	// to call this method on a regular interval.
+	go func() {
+		var t *time.Ticker
+		if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsPCFTile() {
+			t = time.NewTicker(1 * time.Minute)
+		} else {
+			t = time.NewTicker(10 * time.Minute)
+		}
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				globalDNSCache.RefreshWithOptions(options)
+			case <-GlobalContext.Done():
+				return
+			}
+		}
+	}()
 
 	globalForwarder = handlers.NewForwarder(&handlers.Forwarder{
 		PassHost:     true,
@@ -138,22 +167,30 @@ func minioConfigToConsoleFeatures() {
 	}
 	// if IDP is enabled, set IDP environment variables
 	if globalOpenIDConfig.URL != nil {
-		os.Setenv("CONSOLE_IDP_URL", globalOpenIDConfig.DiscoveryDoc.Issuer)
+		os.Setenv("CONSOLE_IDP_URL", globalOpenIDConfig.URL.String())
 		os.Setenv("CONSOLE_IDP_CLIENT_ID", globalOpenIDConfig.ClientID)
 		os.Setenv("CONSOLE_IDP_SECRET", globalOpenIDConfig.ClientSecret)
 		os.Setenv("CONSOLE_IDP_HMAC_SALT", globalDeploymentID)
 		os.Setenv("CONSOLE_IDP_HMAC_PASSPHRASE", globalOpenIDConfig.ClientID)
 		os.Setenv("CONSOLE_IDP_SCOPES", strings.Join(globalOpenIDConfig.DiscoveryDoc.ScopesSupported, ","))
+		if globalOpenIDConfig.ClaimUserinfo {
+			os.Setenv("CONSOLE_IDP_USERINFO", config.EnableOn)
+		}
+		if globalOpenIDConfig.RedirectURIDynamic {
+			// Enable dynamic redirect-uri's based on incoming 'host' header,
+			// Overrides any other callback URL.
+			os.Setenv("CONSOLE_IDP_CALLBACK_DYNAMIC", config.EnableOn)
+		}
 		if globalOpenIDConfig.RedirectURI != "" {
 			os.Setenv("CONSOLE_IDP_CALLBACK", globalOpenIDConfig.RedirectURI)
 		} else {
 			os.Setenv("CONSOLE_IDP_CALLBACK", getConsoleEndpoints()[0]+"/oauth_callback")
 		}
 	}
-	os.Setenv("CONSOLE_MINIO_REGION", globalServerRegion)
+	os.Setenv("CONSOLE_MINIO_REGION", globalSite.Region)
 	os.Setenv("CONSOLE_CERT_PASSWD", env.Get("MINIO_CERT_PASSWD", ""))
-	if globalSubnetLicense != "" {
-		os.Setenv("CONSOLE_SUBNET_LICENSE", globalSubnetLicense)
+	if globalSubnetConfig.License != "" {
+		os.Setenv("CONSOLE_SUBNET_LICENSE", globalSubnetConfig.License)
 	}
 }
 
@@ -179,16 +216,16 @@ func initConsoleServer() (*restapi.Server, error) {
 		return nil, err
 	}
 
-	noLog := func(string, ...interface{}) {
-		// nothing to log
-	}
-
-	// Initialize MinIO loggers
-	restapi.LogInfo = noLog
-	restapi.LogError = noLog
-
 	api := operations.NewConsoleAPI(swaggerSpec)
-	api.Logger = noLog
+
+	if !serverDebugLog {
+		// Disable console logging if server debug log is not enabled
+		noLog := func(string, ...interface{}) {}
+
+		restapi.LogInfo = noLog
+		restapi.LogError = noLog
+		api.Logger = noLog
+	}
 
 	server := restapi.NewServer(api)
 	// register all APIs
@@ -494,6 +531,7 @@ func handleCommonEnvVars() {
 	// Warn user if deprecated environment variables,
 	// "MINIO_ACCESS_KEY" and "MINIO_SECRET_KEY", are defined
 	// Check all error conditions first
+	//nolint:gocritic
 	if !env.IsSet(config.EnvRootUser) && env.IsSet(config.EnvRootPassword) {
 		logger.Fatal(config.ErrMissingEnvCredentialRootUser(nil), "Unable to start MinIO")
 	} else if env.IsSet(config.EnvRootUser) && !env.IsSet(config.EnvRootPassword) {
@@ -512,6 +550,7 @@ func handleCommonEnvVars() {
 	var user, password string
 	haveRootCredentials := false
 	haveAccessCredentials := false
+	//nolint:gocritic
 	if env.IsSet(config.EnvRootUser) && env.IsSet(config.EnvRootPassword) {
 		user = env.Get(config.EnvRootUser, "")
 		password = env.Get(config.EnvRootPassword, "")
@@ -595,12 +634,6 @@ func handleCommonEnvVars() {
 		}
 		GlobalKMS = KMS
 	}
-
-	if tiers := env.Get("_MINIO_DEBUG_REMOTE_TIERS_IMMEDIATELY", ""); tiers != "" {
-		globalDebugRemoteTiersImmediately = strings.Split(tiers, ",")
-	}
-
-	globalSubnetLicense = env.Get(config.EnvMinIOSubnetLicense, "")
 }
 
 func logStartupMessage(msg string) {

@@ -18,12 +18,12 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -308,14 +308,6 @@ func getLocalDisksToHeal() (disksToHeal Endpoints) {
 
 }
 
-func initBackgroundHealing(ctx context.Context, objAPI ObjectLayer) {
-	// Run the background healer
-	globalBackgroundHealRoutine = newHealRoutine()
-	go globalBackgroundHealRoutine.run(ctx, objAPI)
-
-	globalBackgroundHealState.LaunchNewHealSequence(newBgHealSequence(), objAPI)
-}
-
 // monitorLocalDisksAndHeal - ensures that detected new disks are healed
 //  1. Only the concerned erasure set will be listed and healed
 //  2. Only the node hosting the disk is responsible to perform the heal
@@ -337,10 +329,10 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 			healDisks := globalBackgroundHealState.getHealLocalDiskEndpoints()
 			if len(healDisks) > 0 {
 				// Reformat disks
-				bgSeq.sourceCh <- healSource{bucket: SlashSeparator}
+				bgSeq.queueHealTask(healSource{bucket: SlashSeparator}, madmin.HealItemMetadata)
 
 				// Ensure that reformatting disks is finished
-				bgSeq.sourceCh <- healSource{bucket: nopHeal}
+				bgSeq.queueHealTask(healSource{bucket: nopHeal}, madmin.HealItemMetadata)
 
 				logger.Info(fmt.Sprintf("Found drives to heal %d, proceeding to heal content...",
 					len(healDisks)))
@@ -420,7 +412,8 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 							// So someone changed the drives underneath, healing tracker missing.
 							tracker, err := loadHealingTracker(ctx, disk)
 							if err != nil {
-								logger.Info("Healing tracker missing on '%s', disk was swapped again on %s pool", disk, humanize.Ordinal(i+1))
+								logger.Info("Healing tracker missing on '%s', disk was swapped again on %s pool",
+									disk, humanize.Ordinal(i+1))
 								tracker = newHealingTracker(disk)
 							}
 
@@ -442,16 +435,15 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 								return
 							}
 
-							err = z.serverPools[i].sets[setIndex].healErasureSet(ctx, buckets, tracker)
+							err = z.serverPools[i].sets[setIndex].healErasureSet(ctx, tracker.QueuedBuckets, tracker)
 							if err != nil {
 								logger.LogIf(ctx, err)
 								continue
 							}
 
 							logger.Info("Healing disk '%s' on %s pool complete", disk, humanize.Ordinal(i+1))
-							var buf bytes.Buffer
-							tracker.printTo(&buf)
-							logger.Info("Summary:\n%s", buf.String())
+							logger.Info("Summary:\n")
+							tracker.printTo(os.Stdout)
 							logger.LogIf(ctx, tracker.delete(ctx))
 
 							// Only upon success pop the healed disk.

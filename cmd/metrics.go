@@ -18,13 +18,11 @@
 package cmd
 
 import (
-	"math"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/logger"
 	iampolicy "github.com/minio/pkg/iam/policy"
 	"github.com/prometheus/client_golang/prometheus"
@@ -109,6 +107,10 @@ func (c *minioCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func nodeHealthMetricsPrometheus(ch chan<- prometheus.Metric) {
+	if globalIsGateway {
+		return
+	}
+
 	nodesUp, nodesDown := GetPeerOnlineCount()
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(
@@ -432,34 +434,6 @@ func networkMetricsPrometheus(ch chan<- prometheus.Metric) {
 		prometheus.CounterValue,
 		float64(connStats.S3InputBytes),
 	)
-}
-
-// get the most current of in-memory replication stats  and data usage info from crawler.
-func getLatestReplicationStats(bucket string, u madmin.BucketUsageInfo) (s BucketReplicationStats) {
-	bucketStats := globalNotificationSys.GetClusterBucketStats(GlobalContext, bucket)
-
-	replStats := BucketReplicationStats{}
-	for _, bucketStat := range bucketStats {
-		replStats.FailedCount += bucketStat.ReplicationStats.FailedCount
-		replStats.FailedSize += bucketStat.ReplicationStats.FailedSize
-		replStats.ReplicaSize += bucketStat.ReplicationStats.ReplicaSize
-		replStats.ReplicatedSize += bucketStat.ReplicationStats.ReplicatedSize
-	}
-	usageStat := globalReplicationStats.GetInitialUsage(bucket)
-	replStats.ReplicaSize += usageStat.ReplicaSize
-	replStats.ReplicatedSize += usageStat.ReplicatedSize
-
-	// use in memory replication stats if it is ahead of usage info.
-	s.ReplicatedSize = u.ReplicatedSize
-	if replStats.ReplicatedSize >= u.ReplicatedSize {
-		s.ReplicatedSize = replStats.ReplicatedSize
-	}
-	// Reset FailedSize and FailedCount to 0 for negative overflows which can
-	// happen since data usage picture can lag behind actual usage state at the time of cluster start
-	s.FailedSize = uint64(math.Max(float64(replStats.FailedSize), 0))
-	s.FailedCount = uint64(math.Max(float64(replStats.FailedCount), 0))
-	s.ReplicaSize = uint64(math.Max(float64(replStats.ReplicaSize), float64(u.ReplicaSize)))
-	return s
 }
 
 // Populates prometheus with bucket usage metrics, this metrics

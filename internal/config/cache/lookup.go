@@ -56,7 +56,7 @@ const (
 	DefaultAfter         = "0"
 	DefaultWaterMarkLow  = "70"
 	DefaultWaterMarkHigh = "80"
-	DefaultCacheCommit   = "writethrough"
+	DefaultCacheCommit   = WriteThrough
 )
 
 // DefaultKVS - default KV settings for caching.
@@ -219,11 +219,11 @@ func LookupConfig(kvs config.KVS) (Config, error) {
 		cfg.Range = rng
 	}
 	if commit := env.Get(EnvCacheCommit, kvs.Get(Commit)); commit != "" {
-		cfg.CommitWriteback, err = parseCacheCommitMode(commit)
+		cfg.CacheCommitMode, err = parseCacheCommitMode(commit)
 		if err != nil {
 			return cfg, err
 		}
-		if cfg.After > 0 && cfg.CommitWriteback {
+		if cfg.After > 0 && cfg.CacheCommitMode != WriteThrough {
 			err := errors.New("cache after cannot be used with commit writeback")
 			return cfg, config.ErrInvalidCacheSetting(err)
 		}

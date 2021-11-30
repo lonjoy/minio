@@ -19,8 +19,6 @@ package cmd
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"net/http"
 	"sync"
 	"time"
@@ -30,6 +28,7 @@ import (
 	minio "github.com/minio/minio-go/v7"
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/kms"
@@ -37,7 +36,7 @@ import (
 )
 
 const (
-	defaultHealthCheckDuration = 100 * time.Second
+	defaultHealthCheckDuration = 30 * time.Second
 )
 
 // BucketTargetSys represents bucket targets subsystem
@@ -93,6 +92,9 @@ func (sys *BucketTargetSys) Delete(bucket string) {
 		return
 	}
 	for _, t := range tgts {
+		if tgt, ok := sys.arnRemotesMap[t.Arn]; ok && tgt.healthCancelFn != nil {
+			tgt.healthCancelFn()
+		}
 		delete(sys.arnRemotesMap, t.Arn)
 	}
 	delete(sys.targetsMap, bucket)
@@ -136,24 +138,28 @@ func (sys *BucketTargetSys) SetTarget(ctx context.Context, bucket string, tgt *m
 	defer sys.Unlock()
 
 	tgts := sys.targetsMap[bucket]
-
 	newtgts := make([]madmin.BucketTarget, len(tgts))
 	found := false
 	for idx, t := range tgts {
 		if t.Type == tgt.Type {
-			if t.Arn == tgt.Arn && !update {
-				return BucketRemoteAlreadyExists{Bucket: t.TargetBucket}
+			if t.Arn == tgt.Arn {
+				if !update {
+					return BucketRemoteAlreadyExists{Bucket: t.TargetBucket}
+				}
+				newtgts[idx] = *tgt
+				found = true
+				continue
 			}
-			newtgts[idx] = *tgt
-			found = true
-			continue
 		}
 		newtgts[idx] = t
 	}
 	if !found && !update {
 		newtgts = append(newtgts, *tgt)
 	}
-
+	// cancel health check for previous target client to avoid leak.
+	if prevClnt, ok := sys.arnRemotesMap[tgt.Arn]; ok && prevClnt.healthCancelFn != nil {
+		prevClnt.healthCancelFn()
+	}
 	sys.targetsMap[bucket] = newtgts
 	sys.arnRemotesMap[tgt.Arn] = clnt
 	sys.updateBandwidthLimit(bucket, tgt.BandwidthLimit)
@@ -194,12 +200,16 @@ func (sys *BucketTargetSys) RemoveTarget(ctx context.Context, bucket, arnStr str
 	if arn.Type == madmin.ReplicationService {
 		// reject removal of remote target if replication configuration is present
 		rcfg, err := getReplicationConfig(ctx, bucket)
-		if err == nil && rcfg.RoleArn == arnStr {
-			sys.RLock()
-			_, ok := sys.arnRemotesMap[arnStr]
-			sys.RUnlock()
-			if ok {
-				return BucketRemoteRemoveDisallowed{Bucket: bucket}
+		if err == nil {
+			for _, tgtArn := range rcfg.FilterTargetArns(replication.ObjectOpts{}) {
+				if err == nil && (tgtArn == arnStr || rcfg.RoleArn == arnStr) {
+					sys.RLock()
+					_, ok := sys.arnRemotesMap[arnStr]
+					sys.RUnlock()
+					if ok {
+						return BucketRemoteRemoveDisallowed{Bucket: bucket}
+					}
+				}
 			}
 		}
 	}
@@ -224,6 +234,9 @@ func (sys *BucketTargetSys) RemoveTarget(ctx context.Context, bucket, arnStr str
 		return BucketRemoteTargetNotFound{Bucket: bucket}
 	}
 	sys.targetsMap[bucket] = targets
+	if tgt, ok := sys.arnRemotesMap[arnStr]; ok && tgt.healthCancelFn != nil {
+		tgt.healthCancelFn()
+	}
 	delete(sys.arnRemotesMap, arnStr)
 	sys.updateBandwidthLimit(bucket, 0)
 	return nil
@@ -259,22 +272,6 @@ func NewBucketTargetSys() *BucketTargetSys {
 	}
 }
 
-// Init initializes the bucket targets subsystem for buckets which have targets configured.
-func (sys *BucketTargetSys) Init(ctx context.Context, buckets []BucketInfo, objAPI ObjectLayer) error {
-	if objAPI == nil {
-		return errServerNotInitialized
-	}
-
-	// In gateway mode, bucket targets is not supported.
-	if globalIsGateway {
-		return nil
-	}
-
-	// Load bucket targets once during boot in background.
-	go sys.load(ctx, buckets, objAPI)
-	return nil
-}
-
 // UpdateAllTargets updates target to reflect metadata updates
 func (sys *BucketTargetSys) UpdateAllTargets(bucket string, tgts *madmin.BucketTargets) {
 	if sys == nil {
@@ -286,6 +283,9 @@ func (sys *BucketTargetSys) UpdateAllTargets(bucket string, tgts *madmin.BucketT
 		// remove target and arn association
 		if tgts, ok := sys.targetsMap[bucket]; ok {
 			for _, t := range tgts {
+				if tgt, ok := sys.arnRemotesMap[t.Arn]; ok && tgt.healthCancelFn != nil {
+					tgt.healthCancelFn()
+				}
 				delete(sys.arnRemotesMap, t.Arn)
 			}
 		}
@@ -309,30 +309,26 @@ func (sys *BucketTargetSys) UpdateAllTargets(bucket string, tgts *madmin.BucketT
 }
 
 // create minio-go clients for buckets having remote targets
-func (sys *BucketTargetSys) load(ctx context.Context, buckets []BucketInfo, objAPI ObjectLayer) {
-	for _, bucket := range buckets {
-		cfg, err := globalBucketMetadataSys.GetBucketTargetsConfig(bucket.Name)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			continue
-		}
-		if cfg == nil || cfg.Empty() {
-			continue
-		}
-		if len(cfg.Targets) > 0 {
-			sys.targetsMap[bucket.Name] = cfg.Targets
-		}
-		for _, tgt := range cfg.Targets {
-			tgtClient, err := sys.getRemoteTargetClient(&tgt)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				continue
-			}
-			sys.arnRemotesMap[tgt.Arn] = tgtClient
-			sys.updateBandwidthLimit(bucket.Name, tgt.BandwidthLimit)
-		}
+func (sys *BucketTargetSys) set(bucket BucketInfo, meta BucketMetadata) {
+	cfg := meta.bucketTargetConfig
+	if cfg == nil || cfg.Empty() {
+		return
+	}
+	sys.Lock()
+	defer sys.Unlock()
+	if len(cfg.Targets) > 0 {
 		sys.targetsMap[bucket.Name] = cfg.Targets
 	}
+	for _, tgt := range cfg.Targets {
+		tgtClient, err := sys.getRemoteTargetClient(&tgt)
+		if err != nil {
+			logger.LogIf(GlobalContext, err)
+			continue
+		}
+		sys.arnRemotesMap[tgt.Arn] = tgtClient
+		sys.updateBandwidthLimit(bucket.Name, tgt.BandwidthLimit)
+	}
+	sys.targetsMap[bucket.Name] = cfg.Targets
 }
 
 // getRemoteTargetInstanceTransport contains a singleton roundtripper.
@@ -360,6 +356,10 @@ func (sys *BucketTargetSys) getRemoteTargetClient(tcfg *madmin.BucketTarget) (*T
 	if tcfg.HealthCheckDuration >= 1 { // require minimum health check duration of 1 sec.
 		hcDuration = tcfg.HealthCheckDuration
 	}
+	cancelFn, err := api.HealthCheck(hcDuration)
+	if err != nil {
+		return nil, err
+	}
 	tc := &TargetClient{
 		Client:              api,
 		healthCheckDuration: hcDuration,
@@ -367,6 +367,9 @@ func (sys *BucketTargetSys) getRemoteTargetClient(tcfg *madmin.BucketTarget) (*T
 		Bucket:              tcfg.TargetBucket,
 		StorageClass:        tcfg.StorageClass,
 		disableProxy:        tcfg.DisableProxy,
+		healthCancelFn:      cancelFn,
+		ARN:                 tcfg.Arn,
+		ResetID:             tcfg.ResetID,
 	}
 	return tc, nil
 }
@@ -390,14 +393,9 @@ func (sys *BucketTargetSys) getRemoteARN(bucket string, target *madmin.BucketTar
 
 // generate ARN that is unique to this target type
 func generateARN(t *madmin.BucketTarget) string {
-	hash := sha256.New()
-	hash.Write([]byte(t.Type))
-	hash.Write([]byte(t.Region))
-	hash.Write([]byte(t.TargetBucket))
-	hashSum := hex.EncodeToString(hash.Sum(nil))
 	arn := madmin.ARN{
 		Type:   t.Type,
-		ID:     hashSum,
+		ID:     mustGetUUID(),
 		Region: t.Region,
 		Bucket: t.TargetBucket,
 	}
@@ -445,4 +443,7 @@ type TargetClient struct {
 	replicateSync       bool
 	StorageClass        string // storage class on remote
 	disableProxy        bool
+	healthCancelFn      context.CancelFunc // cancellation function for client healthcheck
+	ARN                 string             // ARN to uniquely identify remote target
+	ResetID             string
 }

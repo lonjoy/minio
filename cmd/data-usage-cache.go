@@ -46,20 +46,74 @@ type dataUsageHash string
 // sizeHistogram is a size histogram.
 type sizeHistogram [dataUsageBucketLen]uint64
 
-//msgp:tuple dataUsageEntry
 type dataUsageEntry struct {
-	Children dataUsageHashMap
+	Children dataUsageHashMap `msg:"ch"`
 	// These fields do no include any children.
-	Size             int64
-	Objects          uint64
-	Versions         uint64 // Versions that are not delete markers.
-	ObjSizes         sizeHistogram
-	ReplicationStats *replicationStats
-	Compacted        bool
+	Size             int64                `msg:"sz"`
+	Objects          uint64               `msg:"os"`
+	Versions         uint64               `msg:"vs"` // Versions that are not delete markers.
+	ObjSizes         sizeHistogram        `msg:"szs"`
+	ReplicationStats *replicationAllStats `msg:"rs,omitempty"`
+	AllTierStats     *allTierStats        `msg:"ats,omitempty"`
+	Compacted        bool                 `msg:"c"`
 }
 
-//msgp:tuple replicationStats
-type replicationStats struct {
+// allTierStats is a collection of per-tier stats across all configured remote
+// tiers.
+type allTierStats struct {
+	Tiers map[string]tierStats `msg:"ts"`
+}
+
+func newAllTierStats() *allTierStats {
+	return &allTierStats{
+		Tiers: make(map[string]tierStats),
+	}
+}
+
+func (ats *allTierStats) addSizes(sz sizeSummary) {
+	for tier, st := range sz.tiers {
+		ats.Tiers[tier] = ats.Tiers[tier].add(st)
+	}
+}
+
+func (ats *allTierStats) merge(other *allTierStats) {
+	for tier, st := range other.Tiers {
+		ats.Tiers[tier] = ats.Tiers[tier].add(st)
+	}
+}
+
+func (ats *allTierStats) adminStats(stats map[string]madmin.TierStats) map[string]madmin.TierStats {
+	if ats == nil {
+		return stats
+	}
+
+	// Update stats for tiers as they become available.
+	for tier, st := range ats.Tiers {
+		stats[tier] = madmin.TierStats{
+			TotalSize:   st.TotalSize,
+			NumVersions: st.NumVersions,
+			NumObjects:  st.NumObjects,
+		}
+	}
+	return stats
+}
+
+// tierStats holds per-tier stats of a remote tier.
+type tierStats struct {
+	TotalSize   uint64 `msg:"ts"`
+	NumVersions int    `msg:"nv"`
+	NumObjects  int    `msg:"no"`
+}
+
+func (ts tierStats) add(u tierStats) tierStats {
+	ts.TotalSize += u.TotalSize
+	ts.NumVersions += u.NumVersions
+	ts.NumObjects += u.NumObjects
+	return ts
+}
+
+//msgp:tuple replicationStatsV1
+type replicationStatsV1 struct {
 	PendingSize          uint64
 	ReplicatedSize       uint64
 	FailedSize           uint64
@@ -72,8 +126,44 @@ type replicationStats struct {
 	AfterThresholdCount  uint64
 }
 
-//msgp:encode ignore dataUsageEntryV2 dataUsageEntryV3 dataUsageEntryV4
-//msgp:marshal ignore dataUsageEntryV2 dataUsageEntryV3 dataUsageEntryV4
+func (rsv1 replicationStatsV1) Empty() bool {
+	return rsv1.ReplicatedSize == 0 &&
+		rsv1.FailedSize == 0 &&
+		rsv1.FailedCount == 0
+}
+
+//msgp:tuple replicationStats
+type replicationStats struct {
+	PendingSize          uint64
+	ReplicatedSize       uint64
+	FailedSize           uint64
+	FailedCount          uint64
+	PendingCount         uint64
+	MissedThresholdSize  uint64
+	AfterThresholdSize   uint64
+	MissedThresholdCount uint64
+	AfterThresholdCount  uint64
+}
+
+func (rs replicationStats) Empty() bool {
+	return rs.ReplicatedSize == 0 &&
+		rs.FailedSize == 0 &&
+		rs.FailedCount == 0
+}
+
+type replicationAllStats struct {
+	Targets     map[string]replicationStats `msg:"t,omitempty"`
+	ReplicaSize uint64                      `msg:"r,omitempty"`
+}
+
+//msgp:tuple replicationAllStatsV1
+type replicationAllStatsV1 struct {
+	Targets     map[string]replicationStats
+	ReplicaSize uint64 `msg:"ReplicaSize,omitempty"`
+}
+
+//msgp:encode ignore dataUsageEntryV2 dataUsageEntryV3 dataUsageEntryV4 dataUsageEntryV5 dataUsageEntryV6
+//msgp:marshal ignore dataUsageEntryV2 dataUsageEntryV3 dataUsageEntryV4 dataUsageEntryV5 dataUsageEntryV6
 
 //msgp:tuple dataUsageEntryV2
 type dataUsageEntryV2 struct {
@@ -104,7 +194,31 @@ type dataUsageEntryV4 struct {
 	Size             int64
 	Objects          uint64
 	ObjSizes         sizeHistogram
-	ReplicationStats replicationStats
+	ReplicationStats replicationStatsV1
+}
+
+//msgp:tuple dataUsageEntryV5
+type dataUsageEntryV5 struct {
+	Children dataUsageHashMap
+	// These fields do no include any children.
+	Size             int64
+	Objects          uint64
+	Versions         uint64 // Versions that are not delete markers.
+	ObjSizes         sizeHistogram
+	ReplicationStats *replicationStatsV1
+	Compacted        bool
+}
+
+//msgp:tuple dataUsageEntryV6
+type dataUsageEntryV6 struct {
+	Children dataUsageHashMap
+	// These fields do no include any children.
+	Size             int64
+	Objects          uint64
+	Versions         uint64 // Versions that are not delete markers.
+	ObjSizes         sizeHistogram
+	ReplicationStats *replicationAllStatsV1
+	Compacted        bool
 }
 
 // dataUsageCache contains a cache of data usage entries latest version.
@@ -114,8 +228,8 @@ type dataUsageCache struct {
 	Disks []string
 }
 
-//msgp:encode ignore dataUsageCacheV2 dataUsageCacheV3 dataUsageCacheV4
-//msgp:marshal ignore dataUsageCacheV2 dataUsageCacheV3 dataUsageCacheV4
+//msgp:encode ignore dataUsageCacheV2 dataUsageCacheV3 dataUsageCacheV4 dataUsageCacheV5 dataUsageCacheV6
+//msgp:marshal ignore dataUsageCacheV2 dataUsageCacheV3 dataUsageCacheV4 dataUsageCacheV5 dataUsageCacheV6
 
 // dataUsageCacheV2 contains a cache of data usage entries version 2.
 type dataUsageCacheV2 struct {
@@ -124,18 +238,32 @@ type dataUsageCacheV2 struct {
 	Cache map[string]dataUsageEntryV2
 }
 
-// dataUsageCache contains a cache of data usage entries version 3.
+// dataUsageCacheV3 contains a cache of data usage entries version 3.
 type dataUsageCacheV3 struct {
 	Info  dataUsageCacheInfo
 	Disks []string
 	Cache map[string]dataUsageEntryV3
 }
 
-// dataUsageCache contains a cache of data usage entries version 4.
+// dataUsageCacheV4 contains a cache of data usage entries version 4.
 type dataUsageCacheV4 struct {
 	Info  dataUsageCacheInfo
 	Disks []string
 	Cache map[string]dataUsageEntryV4
+}
+
+// dataUsageCacheV5 contains a cache of data usage entries version 5.
+type dataUsageCacheV5 struct {
+	Info  dataUsageCacheInfo
+	Disks []string
+	Cache map[string]dataUsageEntryV5
+}
+
+// dataUsageCacheV6 contains a cache of data usage entries version 6.
+type dataUsageCacheV6 struct {
+	Info  dataUsageCacheInfo
+	Disks []string
+	Cache map[string]dataUsageEntryV6
 }
 
 //msgp:ignore dataUsageEntryInfo
@@ -170,17 +298,34 @@ func (e *dataUsageEntry) addSizes(summary sizeSummary) {
 	e.Versions += summary.versions
 	e.ObjSizes.add(summary.totalSize)
 
-	if summary.replicaSize > 0 || summary.pendingSize > 0 || summary.replicatedSize > 0 ||
-		summary.failedCount > 0 || summary.pendingCount > 0 || summary.failedSize > 0 {
-		if e.ReplicationStats == nil {
-			e.ReplicationStats = &replicationStats{}
+	if e.ReplicationStats == nil {
+		e.ReplicationStats = &replicationAllStats{
+			Targets: make(map[string]replicationStats),
 		}
-		e.ReplicationStats.ReplicatedSize += uint64(summary.replicatedSize)
-		e.ReplicationStats.FailedSize += uint64(summary.failedSize)
-		e.ReplicationStats.PendingSize += uint64(summary.pendingSize)
-		e.ReplicationStats.ReplicaSize += uint64(summary.replicaSize)
-		e.ReplicationStats.PendingCount += summary.pendingCount
-		e.ReplicationStats.FailedCount += summary.failedCount
+	} else if e.ReplicationStats.Targets == nil {
+		e.ReplicationStats.Targets = make(map[string]replicationStats)
+	}
+	e.ReplicationStats.ReplicaSize += uint64(summary.replicaSize)
+
+	if summary.replTargetStats != nil {
+		for arn, st := range summary.replTargetStats {
+			tgtStat, ok := e.ReplicationStats.Targets[arn]
+			if !ok {
+				tgtStat = replicationStats{}
+			}
+			tgtStat.PendingSize += uint64(st.pendingSize)
+			tgtStat.FailedSize += uint64(st.failedSize)
+			tgtStat.ReplicatedSize += uint64(st.replicatedSize)
+			tgtStat.FailedCount += st.failedCount
+			tgtStat.PendingCount += st.pendingCount
+			e.ReplicationStats.Targets[arn] = tgtStat
+		}
+	}
+	if summary.tiers != nil {
+		if e.AllTierStats == nil {
+			e.AllTierStats = newAllTierStats()
+		}
+		e.AllTierStats.addSizes(summary)
 	}
 }
 
@@ -189,23 +334,34 @@ func (e *dataUsageEntry) merge(other dataUsageEntry) {
 	e.Objects += other.Objects
 	e.Versions += other.Versions
 	e.Size += other.Size
-	ors := other.ReplicationStats
-	empty := replicationStats{}
-	if ors != nil && *ors != empty {
+	if other.ReplicationStats != nil {
 		if e.ReplicationStats == nil {
-			e.ReplicationStats = &replicationStats{}
+			e.ReplicationStats = &replicationAllStats{Targets: make(map[string]replicationStats)}
+		} else if e.ReplicationStats.Targets == nil {
+			e.ReplicationStats.Targets = make(map[string]replicationStats)
 		}
-		e.ReplicationStats.PendingSize += other.ReplicationStats.PendingSize
-		e.ReplicationStats.FailedSize += other.ReplicationStats.FailedSize
-		e.ReplicationStats.ReplicatedSize += other.ReplicationStats.ReplicatedSize
 		e.ReplicationStats.ReplicaSize += other.ReplicationStats.ReplicaSize
-		e.ReplicationStats.PendingCount += other.ReplicationStats.PendingCount
-		e.ReplicationStats.FailedCount += other.ReplicationStats.FailedCount
-
+		for arn, stat := range other.ReplicationStats.Targets {
+			st := e.ReplicationStats.Targets[arn]
+			e.ReplicationStats.Targets[arn] = replicationStats{
+				PendingSize:    stat.PendingSize + st.PendingSize,
+				FailedSize:     stat.FailedSize + st.FailedSize,
+				ReplicatedSize: stat.ReplicatedSize + st.ReplicatedSize,
+				PendingCount:   stat.PendingCount + st.PendingCount,
+				FailedCount:    stat.FailedCount + st.FailedCount,
+			}
+		}
 	}
 
 	for i, v := range other.ObjSizes[:] {
 		e.ObjSizes[i] += v
+	}
+
+	if other.AllTierStats != nil {
+		if e.AllTierStats == nil {
+			e.AllTierStats = newAllTierStats()
+		}
+		e.AllTierStats.merge(other.AllTierStats)
 	}
 }
 
@@ -236,6 +392,29 @@ func (e *dataUsageEntry) removeChild(hash dataUsageHash) {
 	if len(e.Children) > 0 {
 		delete(e.Children, hash.Key())
 	}
+}
+
+// Create a clone of the entry.
+func (e dataUsageEntry) clone() dataUsageEntry {
+	// We operate on a copy from the receiver.
+	if e.Children != nil {
+		ch := make(dataUsageHashMap, len(e.Children))
+		for k, v := range e.Children {
+			ch[k] = v
+		}
+		e.Children = ch
+	}
+	if e.ReplicationStats != nil {
+		// Copy to new struct
+		r := *e.ReplicationStats
+		e.ReplicationStats = &r
+	}
+	if e.AllTierStats != nil {
+		ats := newAllTierStats()
+		ats.merge(e.AllTierStats)
+		e.AllTierStats = ats
+	}
+	return e
 }
 
 // find a path in the cache.
@@ -343,27 +522,20 @@ func (d *dataUsageCache) keepRootChildren(list map[dataUsageHash]struct{}) {
 
 // dui converts the flattened version of the path to madmin.DataUsageInfo.
 // As a side effect d will be flattened, use a clone if this is not ok.
-func (d *dataUsageCache) dui(path string, buckets []BucketInfo) madmin.DataUsageInfo {
+func (d *dataUsageCache) dui(path string, buckets []BucketInfo) DataUsageInfo {
 	e := d.find(path)
 	if e == nil {
 		// No entry found, return empty.
-		return madmin.DataUsageInfo{}
+		return DataUsageInfo{}
 	}
 	flat := d.flatten(*e)
-	dui := madmin.DataUsageInfo{
+	dui := DataUsageInfo{
 		LastUpdate:        d.Info.LastUpdate,
 		ObjectsTotalCount: flat.Objects,
 		ObjectsTotalSize:  uint64(flat.Size),
 		BucketsCount:      uint64(len(e.Children)),
 		BucketsUsage:      d.bucketsUsageInfo(buckets),
-	}
-	if flat.ReplicationStats != nil {
-		dui.ReplicationPendingSize = flat.ReplicationStats.PendingSize
-		dui.ReplicatedSize = flat.ReplicationStats.ReplicatedSize
-		dui.ReplicationFailedSize = flat.ReplicationStats.FailedSize
-		dui.ReplicationPendingCount = flat.ReplicationStats.PendingCount
-		dui.ReplicationFailedCount = flat.ReplicationStats.FailedCount
-		dui.ReplicaSize = flat.ReplicationStats.ReplicaSize
+		TierStats:         d.tiersUsageInfo(buckets),
 	}
 	return dui
 }
@@ -580,28 +752,53 @@ func (h *sizeHistogram) toMap() map[string]uint64 {
 	return res
 }
 
-// bucketsUsageInfo returns the buckets usage info as a map, with
-// key as bucket name
-func (d *dataUsageCache) bucketsUsageInfo(buckets []BucketInfo) map[string]madmin.BucketUsageInfo {
-	var dst = make(map[string]madmin.BucketUsageInfo, len(buckets))
+func (d *dataUsageCache) tiersUsageInfo(buckets []BucketInfo) *allTierStats {
+	dst := newAllTierStats()
 	for _, bucket := range buckets {
 		e := d.find(bucket.Name)
 		if e == nil {
 			continue
 		}
 		flat := d.flatten(*e)
-		bui := madmin.BucketUsageInfo{
+		if flat.AllTierStats == nil {
+			continue
+		}
+		dst.merge(flat.AllTierStats)
+	}
+	if len(dst.Tiers) == 0 {
+		return nil
+	}
+	return dst
+}
+
+// bucketsUsageInfo returns the buckets usage info as a map, with
+// key as bucket name
+func (d *dataUsageCache) bucketsUsageInfo(buckets []BucketInfo) map[string]BucketUsageInfo {
+	var dst = make(map[string]BucketUsageInfo, len(buckets))
+	for _, bucket := range buckets {
+		e := d.find(bucket.Name)
+		if e == nil {
+			continue
+		}
+		flat := d.flatten(*e)
+		bui := BucketUsageInfo{
 			Size:                 uint64(flat.Size),
 			ObjectsCount:         flat.Objects,
 			ObjectSizesHistogram: flat.ObjSizes.toMap(),
 		}
 		if flat.ReplicationStats != nil {
-			bui.ReplicationPendingSize = flat.ReplicationStats.PendingSize
-			bui.ReplicatedSize = flat.ReplicationStats.ReplicatedSize
-			bui.ReplicationFailedSize = flat.ReplicationStats.FailedSize
-			bui.ReplicationPendingCount = flat.ReplicationStats.PendingCount
-			bui.ReplicationFailedCount = flat.ReplicationStats.FailedCount
 			bui.ReplicaSize = flat.ReplicationStats.ReplicaSize
+			bui.ReplicationInfo = make(map[string]BucketTargetUsageInfo, len(flat.ReplicationStats.Targets))
+			for arn, stat := range flat.ReplicationStats.Targets {
+				bui.ReplicationInfo[arn] = BucketTargetUsageInfo{
+					ReplicationPendingSize:  stat.PendingSize,
+					ReplicatedSize:          stat.ReplicatedSize,
+					ReplicationFailedSize:   stat.FailedSize,
+					ReplicationPendingCount: stat.PendingCount,
+					ReplicationFailedCount:  stat.FailedCount,
+				}
+
+			}
 		}
 		dst[bucket.Name] = bui
 	}
@@ -610,24 +807,29 @@ func (d *dataUsageCache) bucketsUsageInfo(buckets []BucketInfo) map[string]madmi
 
 // bucketUsageInfo returns the buckets usage info.
 // If not found all values returned are zero values.
-func (d *dataUsageCache) bucketUsageInfo(bucket string) madmin.BucketUsageInfo {
+func (d *dataUsageCache) bucketUsageInfo(bucket string) BucketUsageInfo {
 	e := d.find(bucket)
 	if e == nil {
-		return madmin.BucketUsageInfo{}
+		return BucketUsageInfo{}
 	}
 	flat := d.flatten(*e)
-	bui := madmin.BucketUsageInfo{
+	bui := BucketUsageInfo{
 		Size:                 uint64(flat.Size),
 		ObjectsCount:         flat.Objects,
 		ObjectSizesHistogram: flat.ObjSizes.toMap(),
 	}
 	if flat.ReplicationStats != nil {
-		bui.ReplicationPendingSize = flat.ReplicationStats.PendingSize
-		bui.ReplicatedSize = flat.ReplicationStats.ReplicatedSize
-		bui.ReplicationFailedSize = flat.ReplicationStats.FailedSize
-		bui.ReplicationPendingCount = flat.ReplicationStats.PendingCount
-		bui.ReplicationFailedCount = flat.ReplicationStats.FailedCount
 		bui.ReplicaSize = flat.ReplicationStats.ReplicaSize
+		bui.ReplicationInfo = make(map[string]BucketTargetUsageInfo, len(flat.ReplicationStats.Targets))
+		for arn, stat := range flat.ReplicationStats.Targets {
+			bui.ReplicationInfo[arn] = BucketTargetUsageInfo{
+				ReplicationPendingSize:  stat.PendingSize,
+				ReplicatedSize:          stat.ReplicatedSize,
+				ReplicationFailedSize:   stat.FailedSize,
+				ReplicationPendingCount: stat.PendingCount,
+				ReplicationFailedCount:  stat.FailedCount,
+			}
+		}
 	}
 	return bui
 }
@@ -672,7 +874,7 @@ func (d *dataUsageCache) clone() dataUsageCache {
 		Cache: make(map[string]dataUsageEntry, len(d.Cache)),
 	}
 	for k, v := range d.Cache {
-		clone.Cache[k] = v
+		clone.Cache[k] = v.clone()
 	}
 	return clone
 }
@@ -726,6 +928,7 @@ func (d *dataUsageCache) load(ctx context.Context, store objectIO, name string) 
 		case ObjectNotFound:
 		case BucketNotFound:
 		case InsufficientReadQuorum:
+		case StorageErr:
 		default:
 			return toObjectErr(err, dataUsageBucket, name)
 		}
@@ -771,7 +974,9 @@ func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) 
 // Bumping the cache version will drop data from previous versions
 // and write new data with the new version.
 const (
-	dataUsageCacheVerCurrent = 5
+	dataUsageCacheVerCurrent = 7
+	dataUsageCacheVerV6      = 6
+	dataUsageCacheVerV5      = 5
 	dataUsageCacheVerV4      = 4
 	dataUsageCacheVerV3      = 3
 	dataUsageCacheVerV2      = 2
@@ -866,11 +1071,17 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 				Children: v.Children,
 			}
 			if v.ReplicatedSize > 0 || v.ReplicaSize > 0 || v.ReplicationFailedSize > 0 || v.ReplicationPendingSize > 0 {
-				due.ReplicationStats = &replicationStats{
-					ReplicatedSize: v.ReplicatedSize,
-					ReplicaSize:    v.ReplicaSize,
-					FailedSize:     v.ReplicationFailedSize,
-					PendingSize:    v.ReplicationPendingSize,
+				cfg, _ := getReplicationConfig(GlobalContext, d.Info.Name)
+				if cfg != nil && cfg.RoleArn != "" {
+					due.ReplicationStats = &replicationAllStats{
+						Targets: make(map[string]replicationStats),
+					}
+					due.ReplicationStats.ReplicaSize = v.ReplicaSize
+					due.ReplicationStats.Targets[cfg.RoleArn] = replicationStats{
+						ReplicatedSize: v.ReplicatedSize,
+						FailedSize:     v.ReplicationFailedSize,
+						PendingSize:    v.ReplicationPendingSize,
+					}
 				}
 			}
 			due.Compacted = len(due.Children) == 0 && k != d.Info.Name
@@ -899,9 +1110,23 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 				ObjSizes: v.ObjSizes,
 				Children: v.Children,
 			}
-			empty := replicationStats{}
+			empty := replicationStatsV1{}
+
 			if v.ReplicationStats != empty {
-				due.ReplicationStats = &v.ReplicationStats
+				cfg, _ := getReplicationConfig(GlobalContext, d.Info.Name)
+				if cfg != nil && cfg.RoleArn != "" {
+					due.ReplicationStats = &replicationAllStats{
+						Targets: make(map[string]replicationStats),
+					}
+					due.ReplicationStats.Targets[cfg.RoleArn] = replicationStats{
+						ReplicatedSize: v.ReplicationStats.ReplicatedSize,
+						FailedSize:     v.ReplicationStats.FailedSize,
+						FailedCount:    v.ReplicationStats.FailedCount,
+						PendingSize:    v.ReplicationStats.PendingSize,
+						PendingCount:   v.ReplicationStats.PendingCount,
+					}
+					due.ReplicationStats.ReplicaSize = v.ReplicationStats.ReplicaSize
+				}
 			}
 			due.Compacted = len(due.Children) == 0 && k != d.Info.Name
 
@@ -909,13 +1134,97 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 		}
 
 		// Populate compacted value and remove unneeded replica stats.
-		empty := replicationStats{}
 		for k, e := range d.Cache {
-			if e.ReplicationStats != nil && *e.ReplicationStats == empty {
+			if e.ReplicationStats != nil && len(e.ReplicationStats.Targets) == 0 {
 				e.ReplicationStats = nil
 			}
-
 			d.Cache[k] = e
+		}
+		return nil
+	case dataUsageCacheVerV5:
+		// Zstd compressed.
+		dec, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(2))
+		if err != nil {
+			return err
+		}
+		defer dec.Close()
+		dold := &dataUsageCacheV5{}
+		if err = dold.DecodeMsg(msgp.NewReader(dec)); err != nil {
+			return err
+		}
+		d.Info = dold.Info
+		d.Disks = dold.Disks
+		d.Cache = make(map[string]dataUsageEntry, len(dold.Cache))
+		for k, v := range dold.Cache {
+			due := dataUsageEntry{
+				Size:     v.Size,
+				Objects:  v.Objects,
+				ObjSizes: v.ObjSizes,
+				Children: v.Children,
+			}
+			if v.ReplicationStats != nil && !v.ReplicationStats.Empty() {
+				cfg, _ := getReplicationConfig(GlobalContext, d.Info.Name)
+				if cfg != nil && cfg.RoleArn != "" {
+					due.ReplicationStats = &replicationAllStats{
+						Targets: make(map[string]replicationStats),
+					}
+					d.Info.replication = replicationConfig{Config: cfg}
+
+					due.ReplicationStats.Targets[cfg.RoleArn] = replicationStats{
+						ReplicatedSize: v.ReplicationStats.ReplicatedSize,
+						FailedSize:     v.ReplicationStats.FailedSize,
+						FailedCount:    v.ReplicationStats.FailedCount,
+						PendingSize:    v.ReplicationStats.PendingSize,
+						PendingCount:   v.ReplicationStats.PendingCount,
+					}
+					due.ReplicationStats.ReplicaSize = v.ReplicationStats.ReplicaSize
+				}
+			}
+			due.Compacted = len(due.Children) == 0 && k != d.Info.Name
+
+			d.Cache[k] = due
+		}
+
+		// Populate compacted value and remove unneeded replica stats.
+		for k, e := range d.Cache {
+			if e.ReplicationStats != nil && len(e.ReplicationStats.Targets) == 0 {
+				e.ReplicationStats = nil
+			}
+			d.Cache[k] = e
+		}
+		return nil
+	case dataUsageCacheVerV6:
+		// Zstd compressed.
+		dec, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(2))
+		if err != nil {
+			return err
+		}
+		defer dec.Close()
+		dold := &dataUsageCacheV6{}
+		if err = dold.DecodeMsg(msgp.NewReader(dec)); err != nil {
+			return err
+		}
+		d.Info = dold.Info
+		d.Disks = dold.Disks
+		d.Cache = make(map[string]dataUsageEntry, len(dold.Cache))
+		for k, v := range dold.Cache {
+			var replicationStats *replicationAllStats
+			if v.ReplicationStats != nil {
+				replicationStats = &replicationAllStats{
+					Targets:     v.ReplicationStats.Targets,
+					ReplicaSize: v.ReplicationStats.ReplicaSize,
+				}
+			}
+			due := dataUsageEntry{
+				Children:         v.Children,
+				Size:             v.Size,
+				Objects:          v.Objects,
+				Versions:         v.Versions,
+				ObjSizes:         v.ObjSizes,
+				ReplicationStats: replicationStats,
+				Compacted:        v.Compacted,
+			}
+			d.Cache[k] = due
 		}
 		return nil
 	case dataUsageCacheVerCurrent:

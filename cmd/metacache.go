@@ -39,6 +39,9 @@ const (
 	// Time in which the initiator of a scan must have reported back.
 	metacacheMaxRunningAge = time.Minute
 
+	// Max time between client calls before dropping an async cache listing.
+	metacacheMaxClientWait = 3 * time.Minute
+
 	// metacacheBlockSize is the number of file/directory entries to have in each block.
 	metacacheBlockSize = 5000
 
@@ -53,18 +56,21 @@ const (
 
 // metacache contains a tracked cache entry.
 type metacache struct {
-	id           string     `msg:"id"`
-	bucket       string     `msg:"b"`
-	root         string     `msg:"root"`
-	recursive    bool       `msg:"rec"`
-	filter       string     `msg:"flt"`
-	status       scanStatus `msg:"stat"`
-	fileNotFound bool       `msg:"fnf"`
-	error        string     `msg:"err"`
-	started      time.Time  `msg:"st"`
+	// do not re-arrange the struct this struct has been ordered to use less
+	// space - if you do so please run https://github.com/orijtech/structslop
+	// and verify if your changes are optimal.
 	ended        time.Time  `msg:"end"`
-	lastUpdate   time.Time  `msg:"u"`
+	started      time.Time  `msg:"st"`
 	lastHandout  time.Time  `msg:"lh"`
+	lastUpdate   time.Time  `msg:"u"`
+	bucket       string     `msg:"b"`
+	filter       string     `msg:"flt"`
+	id           string     `msg:"id"`
+	error        string     `msg:"err"`
+	root         string     `msg:"root"`
+	fileNotFound bool       `msg:"fnf"`
+	status       scanStatus `msg:"stat"`
+	recursive    bool       `msg:"rec"`
 	dataVersion  uint8      `msg:"v"`
 }
 
@@ -82,8 +88,9 @@ func (m *metacache) worthKeeping() bool {
 	case !cache.finished() && time.Since(cache.lastUpdate) > metacacheMaxRunningAge:
 		// Not finished and update for metacacheMaxRunningAge, discard it.
 		return false
-	case cache.finished() && time.Since(cache.lastHandout) > 30*time.Minute:
-		// Keep only for 30 minutes.
+	case cache.finished() && time.Since(cache.lastHandout) > 5*metacacheMaxClientWait:
+		// Keep for 15 minutes after we last saw the client.
+		// Since the cache is finished keeping it a bit longer doesn't hurt us.
 		return false
 	case cache.status == scanStateError || cache.status == scanStateNone:
 		// Remove failed listings after 5 minutes.
@@ -113,6 +120,9 @@ func baseDirFromPrefix(prefix string) string {
 func (m *metacache) update(update metacache) {
 	m.lastUpdate = UTCNow()
 
+	if m.lastHandout.After(m.lastHandout) {
+		m.lastHandout = UTCNow()
+	}
 	if m.status == scanStateStarted && update.status == scanStateSuccess {
 		m.ended = UTCNow()
 	}
@@ -121,7 +131,8 @@ func (m *metacache) update(update metacache) {
 		m.status = update.status
 	}
 
-	if m.status == scanStateStarted && time.Since(m.lastHandout) > 15*time.Minute {
+	if m.status == scanStateStarted && time.Since(m.lastHandout) > metacacheMaxClientWait {
+		// Drop if client hasn't been seen for 3 minutes.
 		m.status = scanStateError
 		m.error = "client not seen"
 	}

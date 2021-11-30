@@ -28,6 +28,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -305,11 +306,11 @@ func (n *hdfsObjects) hdfsPathJoin(args ...string) string {
 	return minio.PathJoin(append([]string{n.subPath, hdfsSeparator}, args...)...)
 }
 
-func (n *hdfsObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+func (n *hdfsObjects) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
 	if !hdfsIsValidBucketName(bucket) {
 		return minio.BucketNameInvalid{Bucket: bucket}
 	}
-	if forceDelete {
+	if opts.Force {
 		return hdfsToObjectErr(ctx, n.clnt.RemoveAll(n.hdfsPathJoin(bucket)), bucket)
 	}
 	return hdfsToObjectErr(ctx, n.clnt.Remove(n.hdfsPathJoin(bucket)), bucket)
@@ -407,6 +408,7 @@ func (n *hdfsObjects) listDirFactory() minio.ListDirFunc {
 
 // ListObjects lists all blobs in HDFS bucket filtered by prefix.
 func (n *hdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, err error) {
+	var mutex sync.Mutex
 	fileInfos := make(map[string]os.FileInfo)
 	targetPath := n.hdfsPathJoin(bucket, prefix)
 
@@ -430,6 +432,9 @@ func (n *hdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, d
 	}
 
 	getObjectInfo := func(ctx context.Context, bucket, entry string) (minio.ObjectInfo, error) {
+		mutex.Lock()
+		defer mutex.Unlock()
+
 		filePath := path.Clean(n.hdfsPathJoin(bucket, entry))
 		fi, ok := fileInfos[filePath]
 

@@ -138,7 +138,7 @@ func validateAdminSignature(ctx context.Context, r *http.Request, region string)
 	var owner bool
 	s3Err := ErrAccessDenied
 	if _, ok := r.Header[xhttp.AmzContentSha256]; ok &&
-		getRequestAuthType(r) == authTypeSigned && !skipContentSha256Cksum(r) {
+		getRequestAuthType(r) == authTypeSigned {
 		// We only support admin credentials to access admin APIs.
 		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
 		if s3Err != ErrNone {
@@ -245,9 +245,10 @@ func getClaimsFromToken(token string) (map[string]interface{}, error) {
 
 	// Session token must have a policy, reject requests without policy
 	// claim.
-	_, pokOpenID := claims.MapClaims[iamPolicyClaimNameOpenID()]
+	_, pokOpenIDClaimName := claims.MapClaims[iamPolicyClaimNameOpenID()]
+	_, pokOpenIDRoleArn := claims.MapClaims[roleArnClaim]
 	_, pokSA := claims.MapClaims[iamPolicyClaimNameSA()]
-	if !pokOpenID && !pokSA {
+	if !pokOpenIDClaimName && !pokOpenIDRoleArn && !pokSA {
 		return nil, errAuthentication
 	}
 
@@ -299,7 +300,7 @@ func checkRequestAuthTypeCredential(ctx context.Context, r *http.Request, action
 		}
 		cred, owner, s3Err = getReqAccessKeyV2(r)
 	case authTypeSigned, authTypePresigned:
-		region := globalServerRegion
+		region := globalSite.Region
 		switch action {
 		case policy.GetBucketLocationAction, policy.ListAllMyBucketsAction:
 			region = ""
@@ -487,6 +488,26 @@ func setAuthHandler(h http.Handler) http.Handler {
 	// handler for validating incoming authorization headers.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		aType := getRequestAuthType(r)
+		if aType == authTypeSigned || aType == authTypeSignedV2 || aType == authTypeStreamingSigned {
+			// Verify if date headers are set, if not reject the request
+			amzDate, errCode := parseAmzDateHeader(r)
+			if errCode != ErrNone {
+				// All our internal APIs are sensitive towards Date
+				// header, for all requests where Date header is not
+				// present we will reject such clients.
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(errCode), r.URL)
+				atomic.AddUint64(&globalHTTPStats.rejectedRequestsTime, 1)
+				return
+			}
+			// Verify if the request date header is shifted by less than globalMaxSkewTime parameter in the past
+			// or in the future, reject request otherwise.
+			curTime := UTCNow()
+			if curTime.Sub(amzDate) > globalMaxSkewTime || amzDate.Sub(curTime) > globalMaxSkewTime {
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrRequestTimeTooSkewed), r.URL)
+				atomic.AddUint64(&globalHTTPStats.rejectedRequestsTime, 1)
+				return
+			}
+		}
 		if isSupportedS3AuthType(aType) || aType == authTypeJWT || aType == authTypeSTS {
 			h.ServeHTTP(w, r)
 			return
@@ -509,7 +530,7 @@ func validateSignature(atype authType, r *http.Request) (auth.Credentials, bool,
 		}
 		cred, owner, s3Err = getReqAccessKeyV2(r)
 	case authTypePresigned, authTypeSigned:
-		region := globalServerRegion
+		region := globalSite.Region
 		if s3Err = isReqAuthenticated(GlobalContext, r, region, serviceS3); s3Err != ErrNone {
 			return cred, owner, s3Err
 		}
@@ -576,7 +597,7 @@ func isPutActionAllowed(ctx context.Context, atype authType, bucketName, objectN
 	case authTypeSignedV2, authTypePresignedV2:
 		cred, owner, s3Err = getReqAccessKeyV2(r)
 	case authTypeStreamingSigned, authTypePresigned, authTypeSigned:
-		region := globalServerRegion
+		region := globalSite.Region
 		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
 	}
 	if s3Err != ErrNone {

@@ -56,7 +56,7 @@ func ParsePublicCertFile(certFile string) (x509Certs []*x509.Certificate, err er
 
 		var x509Cert *x509.Certificate
 		if x509Cert, err = x509.ParseCertificate(pemBlock.Bytes); err != nil {
-			return nil, ErrSSLUnexpectedData(err)
+			return nil, ErrSSLUnexpectedData(nil).Msg("Failed to parse `%s`: %s", certFile, err.Error())
 		}
 
 		x509Certs = append(x509Certs, x509Cert)
@@ -117,9 +117,9 @@ func LoadX509KeyPair(certFile, keyFile string) (tls.Certificate, error) {
 }
 
 // EnsureCertAndKey checks if both client certificate and key paths are provided
-func EnsureCertAndKey(ClientCert, ClientKey string) error {
-	if (ClientCert != "" && ClientKey == "") ||
-		(ClientCert == "" && ClientKey != "") {
+func EnsureCertAndKey(clientCert, clientKey string) error {
+	if (clientCert != "" && clientKey == "") ||
+		(clientCert == "" && clientKey != "") {
 		return errors.New("cert and key must be specified as a pair")
 	}
 	return nil

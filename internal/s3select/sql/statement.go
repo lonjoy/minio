@@ -118,7 +118,7 @@ func ParseSelectStatement(s string) (stmt SelectStatement, err error) {
 }
 
 func validateTableName(from *TableExpression) error {
-	if strings.ToLower(from.Table.BaseKey.String()) != baseTableName {
+	if !strings.EqualFold(from.Table.BaseKey.String(), baseTableName) {
 		return errBadTableName(errors.New("table name must be `s3object`"))
 	}
 
@@ -302,9 +302,8 @@ func (e *SelectStatement) Eval(input, output Record) (Record, error) {
 		// .. WHERE ..`
 
 		// Update count of records output.
-		if e.limitValue > -1 {
-			e.outputCount++
-		}
+		e.outputCount++
+
 		return input.Clone(output), nil
 	}
 
@@ -328,9 +327,7 @@ func (e *SelectStatement) Eval(input, output Record) (Record, error) {
 	}
 
 	// Update count of records output.
-	if e.limitValue > -1 {
-		e.outputCount++
-	}
+	e.outputCount++
 
 	return output, nil
 }

@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os/user"
 	"path"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,10 +38,11 @@ import (
 
 	"github.com/tinylib/msgp/msgp"
 
-	jwtreq "github.com/golang-jwt/jwt/request"
+	jwtreq "github.com/golang-jwt/jwt/v4/request"
 	"github.com/gorilla/mux"
 	"github.com/minio/minio/internal/config"
 	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	xjwt "github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
 	xnet "github.com/minio/pkg/net"
@@ -60,7 +62,6 @@ func (s *storageRESTServer) writeErrorResponse(w http.ResponseWriter, err error)
 		w.WriteHeader(http.StatusForbidden)
 	}
 	w.Write([]byte(err.Error()))
-	w.(http.Flusher).Flush()
 }
 
 // DefaultSkewTime - skew time is 15 minutes between minio peers.
@@ -156,7 +157,6 @@ func (s *storageRESTServer) DiskInfoHandler(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		info.Error = err.Error()
 	}
-	defer w.(http.Flusher).Flush()
 	logger.LogIf(r.Context(), msgp.Encode(w, &info))
 }
 
@@ -178,6 +178,12 @@ func (s *storageRESTServer) NSScannerHandler(w http.ResponseWriter, r *http.Requ
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	resp := streamHTTPResponse(w)
+	defer func() {
+		if r := recover(); r != nil {
+			debug.PrintStack()
+			resp.CloseWithError(fmt.Errorf("panic: %v", r))
+		}
+	}()
 	respW := msgp.NewWriter(resp)
 
 	// Collect updates, stream them before the full cache is sent.
@@ -255,7 +261,6 @@ func (s *storageRESTServer) ListVolsHandler(w http.ResponseWriter, r *http.Reque
 		s.writeErrorResponse(w, err)
 		return
 	}
-	defer w.(http.Flusher).Flush()
 	logger.LogIf(r.Context(), msgp.Encode(w, VolsInfo(infos)))
 }
 
@@ -271,7 +276,6 @@ func (s *storageRESTServer) StatVolHandler(w http.ResponseWriter, r *http.Reques
 		s.writeErrorResponse(w, err)
 		return
 	}
-	defer w.(http.Flusher).Flush()
 	logger.LogIf(r.Context(), msgp.Encode(w, &info))
 }
 
@@ -326,8 +330,8 @@ func (s *storageRESTServer) CreateFileHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	done := keepHTTPResponseAlive(w)
-	done(s.storage.CreateFile(r.Context(), volume, filePath, int64(fileSize), r.Body))
+	done, body := keepHTTPReqResponseAlive(w, r)
+	done(s.storage.CreateFile(r.Context(), volume, filePath, int64(fileSize), body))
 }
 
 // DeleteVersion delete updated metadata.
@@ -501,9 +505,10 @@ func (s *storageRESTServer) ReadAllHandler(w http.ResponseWriter, r *http.Reques
 		s.writeErrorResponse(w, err)
 		return
 	}
+	// Reuse after return.
+	defer metaDataPoolPut(buf)
 	w.Header().Set(xhttp.ContentLength, strconv.Itoa(len(buf)))
 	w.Write(buf)
-	w.(http.Flusher).Flush()
 }
 
 // ReadFileHandler - read section of a file.
@@ -540,6 +545,7 @@ func (s *storageRESTServer) ReadFileHandler(w http.ResponseWriter, r *http.Reque
 		verifier = NewBitrotVerifier(BitrotAlgorithmFromString(vars[storageRESTBitrotAlgo]), hash)
 	}
 	buf := make([]byte, length)
+	defer metaDataPoolPut(buf) // Reuse if we can.
 	_, err = s.storage.ReadFile(r.Context(), volume, filePath, int64(offset), buf, verifier)
 	if err != nil {
 		s.writeErrorResponse(w, err)
@@ -547,7 +553,6 @@ func (s *storageRESTServer) ReadFileHandler(w http.ResponseWriter, r *http.Reque
 	}
 	w.Header().Set(xhttp.ContentLength, strconv.Itoa(len(buf)))
 	w.Write(buf)
-	w.(http.Flusher).Flush()
 }
 
 // ReadFileHandler - read section of a file.
@@ -577,13 +582,12 @@ func (s *storageRESTServer) ReadFileStreamHandler(w http.ResponseWriter, r *http
 	defer rc.Close()
 
 	w.Header().Set(xhttp.ContentLength, strconv.Itoa(length))
-	if _, err = io.Copy(w, rc); err != nil {
+	if _, err = xioutil.Copy(w, rc); err != nil {
 		if !xnet.IsNetworkOrHostDown(err, true) { // do not need to log disconnected clients
 			logger.LogIf(r.Context(), err)
 		}
 		return
 	}
-	w.(http.Flusher).Flush()
 }
 
 // ListDirHandler - list a directory.
@@ -606,7 +610,6 @@ func (s *storageRESTServer) ListDirHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	gob.NewEncoder(w).Encode(&entries)
-	w.(http.Flusher).Flush()
 }
 
 // DeleteFileHandler - delete a file.
@@ -648,7 +651,7 @@ func (s *storageRESTServer) DeleteVersionsHandler(w http.ResponseWriter, r *http
 		return
 	}
 
-	versions := make([]FileInfo, totalVersions)
+	versions := make([]FileInfoVersions, totalVersions)
 	decoder := msgp.NewReader(r.Body)
 	for i := 0; i < totalVersions; i++ {
 		dst := &versions[i]
@@ -671,7 +674,6 @@ func (s *storageRESTServer) DeleteVersionsHandler(w http.ResponseWriter, r *http
 		}
 	}
 	encoder.Encode(dErrsResp)
-	w.(http.Flusher).Flush()
 }
 
 // RenameDataHandler - renames a meta object and data dir to destination.
@@ -719,8 +721,114 @@ func (s *storageRESTServer) RenameFileHandler(w http.ResponseWriter, r *http.Req
 	}
 }
 
+// closeNotifier is itself a ReadCloser that will notify when either an error occurs or
+// the Close() function is called.
+type closeNotifier struct {
+	rc   io.ReadCloser
+	done chan struct{}
+}
+
+func (c *closeNotifier) Read(p []byte) (n int, err error) {
+	n, err = c.rc.Read(p)
+	if err != nil {
+		if c.done != nil {
+			close(c.done)
+			c.done = nil
+		}
+	}
+	return n, err
+}
+
+func (c *closeNotifier) Close() error {
+	if c.done != nil {
+		close(c.done)
+		c.done = nil
+	}
+	return c.rc.Close()
+}
+
+// keepHTTPReqResponseAlive can be used to avoid timeouts with long storage
+// operations, such as bitrot verification or data usage scanning.
+// Every 10 seconds a space character is sent.
+// keepHTTPReqResponseAlive will wait for the returned body to be read before starting the ticker.
+// The returned function should always be called to release resources.
+// An optional error can be sent which will be picked as text only error,
+// without its original type by the receiver.
+// waitForHTTPResponse should be used to the receiving side.
+func keepHTTPReqResponseAlive(w http.ResponseWriter, r *http.Request) (resp func(error), body io.ReadCloser) {
+	bodyDoneCh := make(chan struct{})
+	doneCh := make(chan error)
+	ctx := r.Context()
+	go func() {
+		defer close(doneCh)
+		// Wait for body to be read.
+		select {
+		case <-ctx.Done():
+			return
+		case <-bodyDoneCh:
+		case err, ok := <-doneCh:
+			if !ok {
+				return
+			}
+			if err != nil {
+				_, werr := w.Write([]byte{1})
+				if werr != nil {
+					return
+				}
+				w.Write([]byte(err.Error()))
+			} else {
+				w.Write([]byte{0})
+			}
+			return
+		}
+		// Initiate ticker after body has been read.
+		ticker := time.NewTicker(time.Second * 10)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// Response not ready, write a filler byte.
+				if _, err := w.Write([]byte{32}); err != nil {
+					return
+				}
+				w.(http.Flusher).Flush()
+			case err, ok := <-doneCh:
+				if !ok {
+					return
+				}
+				if err != nil {
+					_, werr := w.Write([]byte{1})
+					if werr != nil {
+						return
+					}
+					w.Write([]byte(err.Error()))
+				} else {
+					w.Write([]byte{0})
+				}
+				return
+			}
+		}
+	}()
+	return func(err error) {
+		if doneCh == nil {
+			return
+		}
+
+		// Indicate we are ready to write.
+		doneCh <- err
+
+		// Wait for channel to be closed so we don't race on writes.
+		<-doneCh
+
+		// Clear so we can be called multiple times without crashing.
+		doneCh = nil
+	}, &closeNotifier{rc: r.Body, done: bodyDoneCh}
+}
+
 // keepHTTPResponseAlive can be used to avoid timeouts with long storage
 // operations, such as bitrot verification or data usage scanning.
+// keepHTTPResponseAlive may NOT be used until the request body has been read,
+// use keepHTTPReqResponseAlive instead.
 // Every 10 seconds a space character is sent.
 // The returned function should always be called to release resources.
 // An optional error can be sent which will be picked as text only error,
@@ -731,20 +839,25 @@ func keepHTTPResponseAlive(w http.ResponseWriter) func(error) {
 	go func() {
 		defer close(doneCh)
 		ticker := time.NewTicker(time.Second * 10)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				// Response not ready, write a filler byte.
-				w.Write([]byte{32})
+				if _, err := w.Write([]byte{32}); err != nil {
+					return
+				}
 				w.(http.Flusher).Flush()
 			case err := <-doneCh:
 				if err != nil {
-					w.Write([]byte{1})
+					_, werr := w.Write([]byte{1})
+					if werr != nil {
+						return
+					}
 					w.Write([]byte(err.Error()))
 				} else {
 					w.Write([]byte{0})
 				}
-				ticker.Stop()
 				return
 			}
 		}
@@ -838,34 +951,55 @@ func streamHTTPResponse(w http.ResponseWriter) *httpStreamResponse {
 	blockCh := make(chan []byte)
 	h := httpStreamResponse{done: doneCh, block: blockCh}
 	go func() {
+		var canWrite = true
+		write := func(b []byte) {
+			if canWrite {
+				n, err := w.Write(b)
+				if err != nil || n != len(b) {
+					canWrite = false
+				}
+			}
+		}
+
 		ticker := time.NewTicker(time.Second * 10)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				// Response not ready, write a filler byte.
-				w.Write([]byte{32})
-				w.(http.Flusher).Flush()
-			case err := <-doneCh:
-				ticker.Stop()
-				defer close(doneCh)
-				if err != nil {
-					w.Write([]byte{1})
-					w.Write([]byte(err.Error()))
-				} else {
-					w.Write([]byte{0})
+				write([]byte{32})
+				if canWrite {
+					w.(http.Flusher).Flush()
 				}
+			case err := <-doneCh:
+				if err != nil {
+					write([]byte{1})
+					write([]byte(err.Error()))
+				} else {
+					write([]byte{0})
+				}
+				close(doneCh)
 				return
 			case block := <-blockCh:
 				var tmp [5]byte
 				tmp[0] = 2
 				binary.LittleEndian.PutUint32(tmp[1:], uint32(len(block)))
-				w.Write(tmp[:])
-				w.Write(block)
-				w.(http.Flusher).Flush()
+				write(tmp[:])
+				write(block)
+				if canWrite {
+					w.(http.Flusher).Flush()
+				}
 			}
 		}
 	}()
 	return &h
+}
+
+var poolBuf8k = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 8192)
+		return &b
+	},
 }
 
 // waitForHTTPStream will wait for responses where
@@ -874,7 +1008,9 @@ func streamHTTPResponse(w http.ResponseWriter) *httpStreamResponse {
 func waitForHTTPStream(respBody io.ReadCloser, w io.Writer) error {
 	var tmp [1]byte
 	// 8K copy buffer, reused for less allocs...
-	var buf [8 << 10]byte
+	bufp := poolBuf8k.Get().(*[]byte)
+	buf := *bufp
+	defer poolBuf8k.Put(bufp)
 	for {
 		_, err := io.ReadFull(respBody, tmp[:])
 		if err != nil {
@@ -884,7 +1020,7 @@ func waitForHTTPStream(respBody io.ReadCloser, w io.Writer) error {
 		switch tmp[0] {
 		case 0:
 			// 0 is unbuffered, copy the rest.
-			_, err := io.CopyBuffer(w, respBody, buf[:])
+			_, err := io.CopyBuffer(w, respBody, buf)
 			if err == io.EOF {
 				return nil
 			}
@@ -903,7 +1039,7 @@ func waitForHTTPStream(respBody io.ReadCloser, w io.Writer) error {
 				return err
 			}
 			length := binary.LittleEndian.Uint32(tmp[:])
-			_, err = io.CopyBuffer(w, io.LimitReader(respBody, int64(length)), buf[:])
+			_, err = io.CopyBuffer(w, io.LimitReader(respBody, int64(length)), buf)
 			if err != nil {
 				return err
 			}
@@ -951,7 +1087,6 @@ func (s *storageRESTServer) VerifyFileHandler(w http.ResponseWriter, r *http.Req
 		vresp.Err = StorageErr(err.Error())
 	}
 	encoder.Encode(vresp)
-	w.(http.Flusher).Flush()
 }
 
 // A single function to write certain errors to be fatal
@@ -1030,13 +1165,16 @@ func (s *storageRESTServer) StatInfoFile(w http.ResponseWriter, r *http.Request)
 	vars := mux.Vars(r)
 	volume := vars[storageRESTVolume]
 	filePath := vars[storageRESTFilePath]
+	glob := vars[storageRESTGlob]
 	done := keepHTTPResponseAlive(w)
-	si, err := s.storage.StatInfoFile(r.Context(), volume, filePath)
+	stats, err := s.storage.StatInfoFile(r.Context(), volume, filePath, glob == "true")
 	done(err)
 	if err != nil {
 		return
 	}
-	msgp.Encode(w, &si)
+	for _, si := range stats {
+		msgp.Encode(w, &si)
+	}
 }
 
 // registerStorageRPCRouter - register storage rpc router.
@@ -1129,7 +1267,7 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodWalkDir).HandlerFunc(httpTraceHdrs(server.WalkDirHandler)).
 				Queries(restQueries(storageRESTVolume, storageRESTDirPath, storageRESTRecursive)...)
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodStatInfoFile).HandlerFunc(httpTraceHdrs(server.StatInfoFile)).
-				Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath, storageRESTGlob)...)
 		}
 	}
 }

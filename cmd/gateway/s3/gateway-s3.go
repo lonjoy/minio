@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -34,9 +35,11 @@ import (
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	minio "github.com/minio/minio/cmd"
+	"github.com/minio/minio/internal/config"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/env"
 )
 
 func init() {
@@ -94,12 +97,16 @@ func s3GatewayMain(ctx *cli.Context) {
 	logger.FatalIf(minio.ValidateGatewayArguments(serverAddr, args.First()), "Invalid argument")
 
 	// Start the gateway..
-	minio.StartGateway(ctx, &S3{args.First()})
+	minio.StartGateway(ctx, &S3{
+		host:  args.First(),
+		debug: env.Get("_MINIO_SERVER_DEBUG", config.EnableOff) == config.EnableOn,
+	})
 }
 
 // S3 implements Gateway.
 type S3 struct {
-	host string
+	host  string
+	debug bool
 }
 
 // Name implements Gateway interface.
@@ -139,7 +146,6 @@ func randString(n int, src rand.Source, prefix string) string {
 var defaultProviders = []credentials.Provider{
 	&credentials.EnvAWS{},
 	&credentials.FileAWSCredentials{},
-	&credentials.EnvMinio{},
 }
 
 // Chains all credential types, in the following order:
@@ -153,15 +159,17 @@ var defaultAWSCredProviders = []credentials.Provider{
 	&credentials.EnvAWS{},
 	&credentials.FileAWSCredentials{},
 	&credentials.IAM{
+		// you can specify a custom STS endpoint.
+		Endpoint: env.Get("MINIO_GATEWAY_S3_STS_ENDPOINT", ""),
 		Client: &http.Client{
 			Transport: minio.NewGatewayHTTPTransport(),
 		},
 	},
-	&credentials.EnvMinio{},
 }
 
-// newS3 - Initializes a new client by auto probing S3 server signature.
-func newS3(urlStr string, tripper http.RoundTripper) (*miniogo.Core, error) {
+// new - Initializes a new client by auto probing S3 server signature.
+func (g *S3) new(creds madmin.Credentials, transport http.RoundTripper) (*miniogo.Core, error) {
+	urlStr := g.host
 	if urlStr == "" {
 		urlStr = "https://s3.amazonaws.com"
 	}
@@ -177,30 +185,70 @@ func newS3(urlStr string, tripper http.RoundTripper) (*miniogo.Core, error) {
 		return nil, err
 	}
 
-	var creds *credentials.Credentials
+	var chainCreds *credentials.Credentials
 	if s3utils.IsAmazonEndpoint(*u) {
 		// If we see an Amazon S3 endpoint, then we use more ways to fetch backend credentials.
 		// Specifically IAM style rotating credentials are only supported with AWS S3 endpoint.
-		creds = credentials.NewChainCredentials(defaultAWSCredProviders)
-
+		chainCreds = NewChainCredentials(defaultAWSCredProviders)
 	} else {
-		creds = credentials.NewChainCredentials(defaultProviders)
+		chainCreds = NewChainCredentials(defaultProviders)
 	}
 
-	options := &miniogo.Options{
-		Creds:        creds,
+	optionsStaticCreds := &miniogo.Options{
+		Creds:        credentials.NewStaticV4(creds.AccessKey, creds.SecretKey, creds.SessionToken),
 		Secure:       secure,
 		Region:       s3utils.GetRegionFromURL(*u),
 		BucketLookup: miniogo.BucketLookupAuto,
-		Transport:    tripper,
+		Transport:    transport,
 	}
 
-	clnt, err := miniogo.New(endpoint, options)
+	optionsChainCreds := &miniogo.Options{
+		Creds:        chainCreds,
+		Secure:       secure,
+		Region:       s3utils.GetRegionFromURL(*u),
+		BucketLookup: miniogo.BucketLookupAuto,
+		Transport:    transport,
+	}
+
+	clntChain, err := miniogo.New(endpoint, optionsChainCreds)
 	if err != nil {
 		return nil, err
 	}
 
-	return &miniogo.Core{Client: clnt}, nil
+	clntStatic, err := miniogo.New(endpoint, optionsStaticCreds)
+	if err != nil {
+		return nil, err
+	}
+
+	if g.debug {
+		clntChain.TraceOn(os.Stderr)
+		clntStatic.TraceOn(os.Stderr)
+	}
+
+	probeBucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "probe-bucket-sign-")
+
+	if _, err = clntStatic.BucketExists(context.Background(), probeBucketName); err != nil {
+		switch miniogo.ToErrorResponse(err).Code {
+		case "InvalidAccessKeyId":
+			// Check if the provided keys are valid for chain.
+			if _, err = clntChain.BucketExists(context.Background(), probeBucketName); err != nil {
+				if miniogo.ToErrorResponse(err).Code != "AccessDenied" {
+					return nil, err
+				}
+			}
+			return &miniogo.Core{Client: clntChain}, nil
+		case "AccessDenied":
+			// this is a good error means backend is reachable
+			// and credentials are valid but credentials don't
+			// have access to 'probeBucketName' which is harmless.
+			return &miniogo.Core{Client: clntStatic}, nil
+		default:
+			return nil, err
+		}
+	}
+
+	// if static keys are valid always use static keys.
+	return &miniogo.Core{Client: clntStatic}, nil
 }
 
 // NewGatewayLayer returns s3 ObjectLayer.
@@ -214,18 +262,9 @@ func (g *S3) NewGatewayLayer(creds madmin.Credentials) (minio.ObjectLayer, error
 
 	// creds are ignored here, since S3 gateway implements chaining
 	// all credentials.
-	clnt, err := newS3(g.host, t)
+	clnt, err := g.new(creds, t)
 	if err != nil {
 		return nil, err
-	}
-
-	probeBucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "probe-bucket-sign-")
-
-	// Check if the provided keys are valid.
-	if _, err = clnt.BucketExists(context.Background(), probeBucketName); err != nil {
-		if miniogo.ToErrorResponse(err).Code != "AccessDenied" {
-			return nil, err
-		}
 	}
 
 	s := s3Objects{
@@ -271,11 +310,17 @@ func (l *s3Objects) Shutdown(ctx context.Context) error {
 // StorageInfo is not relevant to S3 backend.
 func (l *s3Objects) StorageInfo(ctx context.Context) (si minio.StorageInfo, _ []error) {
 	si.Backend.Type = madmin.Gateway
-	host := l.Client.EndpointURL().Host
-	if l.Client.EndpointURL().Port() == "" {
-		host = l.Client.EndpointURL().Host + ":" + l.Client.EndpointURL().Scheme
+	probeBucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "probe-bucket-sign-")
+
+	// check if bucket exists.
+	_, err := l.Client.BucketExists(ctx, probeBucketName)
+	switch miniogo.ToErrorResponse(err).Code {
+	case "", "AccessDenied":
+		si.Backend.GatewayOnline = true
+	default:
+		logger.LogIf(ctx, err)
+		si.Backend.GatewayOnline = false
 	}
-	si.Backend.GatewayOnline = minio.IsBackendOnline(ctx, host)
 	return si, nil
 }
 
@@ -354,7 +399,7 @@ func (l *s3Objects) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error)
 }
 
 // DeleteBucket deletes a bucket on S3
-func (l *s3Objects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+func (l *s3Objects) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
 	err := l.Client.RemoveBucket(ctx, bucket)
 	if err != nil {
 		return minio.ErrorRespToObjectError(err, bucket)
@@ -470,6 +515,10 @@ func (l *s3Objects) PutObject(ctx context.Context, bucket string, object string,
 		UserMetadata:         opts.UserDefined,
 		ServerSideEncryption: opts.ServerSideEncryption,
 		UserTags:             tagMap,
+		// Content-Md5 is needed for buckets with object locking,
+		// instead of spending an extra API call to detect this
+		// we can set md5sum to be calculated always.
+		SendContentMd5: true,
 	}
 	ui, err := l.Client.PutObject(ctx, bucket, object, data, data.Size(), data.MD5Base64String(), data.SHA256HexString(), putOpts)
 	if err != nil {

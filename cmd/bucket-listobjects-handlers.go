@@ -32,8 +32,6 @@ import (
 
 func concurrentDecryptETag(ctx context.Context, objects []ObjectInfo) {
 	g := errgroup.WithNErrs(len(objects)).WithConcurrency(500)
-	_, cancel := g.WithCancelOnError(ctx)
-	defer cancel()
 	for index := range objects {
 		index := index
 		g.Go(func() error {
@@ -45,7 +43,7 @@ func concurrentDecryptETag(ctx context.Context, objects []ObjectInfo) {
 			return nil
 		}, index)
 	}
-	g.WaitErr()
+	g.Wait()
 }
 
 // Validate all the ListObjects query arguments, returns an APIErrorCode
@@ -61,8 +59,8 @@ func validateListObjectsArgs(marker, delimiter, encodingType string, maxKeys int
 	}
 
 	if encodingType != "" {
-		// Only url encoding type is supported
-		if strings.ToLower(encodingType) != "url" {
+		// AWS S3 spec only supports 'url' encoding type
+		if !strings.EqualFold(encodingType, "url") {
 			return ErrInvalidEncodingMethod
 		}
 	}
@@ -128,7 +126,7 @@ func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r 
 
 // ListObjectsV2MHandler - GET Bucket (List Objects) Version 2 with metadata.
 // --------------------------
-// This implementation of the GET operation returns some or all (up to 10000)
+// This implementation of the GET operation returns some or all (up to 1000)
 // of the objects in a bucket. You can use the request parameters as selection
 // criteria to return a subset of the objects in a bucket.
 //
@@ -195,7 +193,7 @@ func (api objectAPIHandlers) ListObjectsV2MHandler(w http.ResponseWriter, r *htt
 
 // ListObjectsV2Handler - GET Bucket (List Objects) Version 2.
 // --------------------------
-// This implementation of the GET operation returns some or all (up to 10000)
+// This implementation of the GET operation returns some or all (up to 1000)
 // of the objects in a bucket. You can use the request parameters as selection
 // criteria to return a subset of the objects in a bucket.
 //
@@ -305,7 +303,7 @@ func proxyRequestByNodeIndex(ctx context.Context, w http.ResponseWriter, r *http
 
 // ListObjectsV1Handler - GET Bucket (List Objects) Version 1.
 // --------------------------
-// This implementation of the GET operation returns some or all (up to 10000)
+// This implementation of the GET operation returns some or all (up to 1000)
 // of the objects in a bucket. You can use the request parameters as selection
 // criteria to return a subset of the objects in a bucket.
 //

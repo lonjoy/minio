@@ -21,17 +21,22 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
-	"compress/bzip2"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"runtime"
 
+	"github.com/cosnicolaou/pbzip2"
 	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/compress/zstd"
 	gzip "github.com/klauspost/pgzip"
 	"github.com/pierrec/lz4"
 )
+
+// Max bzip2 concurrency across calls. 50% of GOMAXPROCS.
+var bz2Limiter = pbzip2.CreateConcurrencyPool((runtime.GOMAXPROCS(0) + 1) / 2)
 
 func detect(r *bufio.Reader) format {
 	z, err := r.Peek(4)
@@ -112,7 +117,11 @@ func untar(r io.Reader, putObject func(reader io.Reader, info os.FileInfo, name 
 		defer dec.Close()
 		r = dec
 	case formatBZ2:
-		r = bzip2.NewReader(bf)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		r = pbzip2.NewReader(ctx, bf, pbzip2.DecompressionOptions(
+			pbzip2.BZConcurrency((runtime.GOMAXPROCS(0)+1)/2),
+			pbzip2.BZConcurrencyPool(bz2Limiter)))
 	case formatLZ4:
 		r = lz4.NewReader(bf)
 	case formatUnknown:

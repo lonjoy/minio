@@ -89,7 +89,10 @@ func (sys *BucketQuotaSys) check(ctx context.Context, bucket string, size int64)
 			return err
 		}
 
-		dui := v.(madmin.DataUsageInfo)
+		dui, ok := v.(DataUsageInfo)
+		if !ok {
+			return fmt.Errorf("internal error: Unexpected DUI data type: %T", v)
+		}
 
 		bui, ok := dui.BucketsUsage[bucket]
 		if !ok {
@@ -116,7 +119,7 @@ func enforceBucketQuota(ctx context.Context, bucket string, size int64) error {
 
 // enforceFIFOQuota deletes objects in FIFO order until sufficient objects
 // have been deleted so as to bring bucket usage within quota.
-func enforceFIFOQuotaBucket(ctx context.Context, objectAPI ObjectLayer, bucket string, bui madmin.BucketUsageInfo) {
+func enforceFIFOQuotaBucket(ctx context.Context, objectAPI ObjectLayer, bucket string, bui BucketUsageInfo) {
 	// Check if the current bucket has quota restrictions, if not skip it
 	cfg, err := globalBucketQuotaSys.Get(bucket)
 	if err != nil {

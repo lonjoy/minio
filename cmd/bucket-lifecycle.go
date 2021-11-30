@@ -75,48 +75,83 @@ func NewLifecycleSys() *LifecycleSys {
 }
 
 type expiryTask struct {
-	objInfo       ObjectInfo
-	versionExpiry bool
+	objInfo        ObjectInfo
+	versionExpiry  bool
+	restoredObject bool
 }
 
 type expiryState struct {
-	once     sync.Once
-	expiryCh chan expiryTask
+	once              sync.Once
+	byDaysCh          chan expiryTask
+	byMaxNoncurrentCh chan maxNoncurrentTask
 }
 
 // PendingTasks returns the number of pending ILM expiry tasks.
 func (es *expiryState) PendingTasks() int {
-	return len(es.expiryCh)
+	return len(es.byDaysCh) + len(es.byMaxNoncurrentCh)
 }
 
-func (es *expiryState) queueExpiryTask(oi ObjectInfo, rmVersion bool) {
+// close closes work channels exactly once.
+func (es *expiryState) close() {
+	es.once.Do(func() {
+		close(es.byDaysCh)
+		close(es.byMaxNoncurrentCh)
+	})
+}
+
+// enqueueByDays enqueues object versions expired by days for expiry.
+func (es *expiryState) enqueueByDays(oi ObjectInfo, restoredObject bool, rmVersion bool) {
 	select {
 	case <-GlobalContext.Done():
-		es.once.Do(func() {
-			close(es.expiryCh)
-		})
-	case es.expiryCh <- expiryTask{objInfo: oi, versionExpiry: rmVersion}:
+		es.close()
+	case es.byDaysCh <- expiryTask{objInfo: oi, versionExpiry: rmVersion, restoredObject: restoredObject}:
 	default:
 	}
 }
 
-var (
-	globalExpiryState *expiryState
-)
+// enqueueByMaxNoncurrent enqueues object versions expired by
+// MaxNoncurrentVersions limit for expiry.
+func (es *expiryState) enqueueByMaxNoncurrent(bucket string, versions []ObjectToDelete) {
+	select {
+	case <-GlobalContext.Done():
+		es.close()
+	case es.byMaxNoncurrentCh <- maxNoncurrentTask{bucket: bucket, versions: versions}:
+	default:
+	}
+}
+
+var globalExpiryState *expiryState
 
 func newExpiryState() *expiryState {
 	return &expiryState{
-		expiryCh: make(chan expiryTask, 10000),
+		byDaysCh:          make(chan expiryTask, 10000),
+		byMaxNoncurrentCh: make(chan maxNoncurrentTask, 10000),
 	}
 }
 
 func initBackgroundExpiry(ctx context.Context, objectAPI ObjectLayer) {
 	globalExpiryState = newExpiryState()
 	go func() {
-		for t := range globalExpiryState.expiryCh {
-			applyExpiryRule(ctx, objectAPI, t.objInfo, false, t.versionExpiry)
+		for t := range globalExpiryState.byDaysCh {
+			if t.objInfo.TransitionedObject.Status != "" {
+				applyExpiryOnTransitionedObject(ctx, objectAPI, t.objInfo, t.restoredObject)
+			} else {
+				applyExpiryOnNonTransitionedObjects(ctx, objectAPI, t.objInfo, t.versionExpiry)
+			}
 		}
 	}()
+	go func() {
+		for t := range globalExpiryState.byMaxNoncurrentCh {
+			deleteObjectVersions(ctx, objectAPI, t.bucket, t.versions)
+		}
+	}()
+}
+
+// maxNoncurrentTask encapsulates arguments required by worker to expire objects
+// by MaxNoncurrentVersions
+type maxNoncurrentTask struct {
+	bucket   string
+	versions []ObjectToDelete
 }
 
 type transitionState struct {
@@ -215,14 +250,29 @@ var errInvalidStorageClass = errors.New("invalid storage class")
 
 func validateTransitionTier(lc *lifecycle.Lifecycle) error {
 	for _, rule := range lc.Rules {
-		if rule.Transition.StorageClass == "" {
-			continue
+		if rule.Transition.StorageClass != "" {
+			if valid := globalTierConfigMgr.IsTierValid(rule.Transition.StorageClass); !valid {
+				return errInvalidStorageClass
+			}
 		}
-		if valid := globalTierConfigMgr.IsTierValid(rule.Transition.StorageClass); !valid {
-			return errInvalidStorageClass
+		if rule.NoncurrentVersionTransition.StorageClass != "" {
+			if valid := globalTierConfigMgr.IsTierValid(rule.NoncurrentVersionTransition.StorageClass); !valid {
+				return errInvalidStorageClass
+			}
 		}
 	}
 	return nil
+}
+
+// enqueueTransitionImmediate enqueues obj for transition if eligible.
+// This is to be called after a successful upload of an object (version).
+func enqueueTransitionImmediate(obj ObjectInfo) {
+	if lc, err := globalLifecycleSys.Get(obj.Bucket); err == nil {
+		switch lc.ComputeAction(obj.ToLifecycleOpts()) {
+		case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
+			globalTransitionState.queueTransitionTask(obj)
+		}
+	}
 }
 
 // expireAction represents different actions to be performed on expiry of a
@@ -247,6 +297,7 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	var opts ObjectOptions
 	opts.Versioned = globalBucketVersioningSys.Enabled(oi.Bucket)
 	opts.VersionID = lcOpts.VersionID
+	opts.Expiration = ExpirationOptions{Expire: true}
 	switch action {
 	case expireObj:
 		// When an object is past expiry or when a transitioned object is being
@@ -327,9 +378,10 @@ func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo)
 			Tier:   lc.TransitionTier(oi.ToLifecycleOpts()),
 			ETag:   oi.ETag,
 		},
-		VersionID: oi.VersionID,
-		Versioned: globalBucketVersioningSys.Enabled(oi.Bucket),
-		MTime:     oi.ModTime,
+		VersionID:        oi.VersionID,
+		Versioned:        globalBucketVersioningSys.Enabled(oi.Bucket),
+		VersionSuspended: globalBucketVersioningSys.Suspended(oi.Bucket),
+		MTime:            oi.ModTime,
 	}
 	return objectAPI.TransitionObject(ctx, oi.Bucket, oi.Name, opts)
 }
@@ -373,9 +425,9 @@ const (
 
 // Encryption specifies encryption setting on restored bucket
 type Encryption struct {
-	EncryptionType sse.SSEAlgorithm `xml:"EncryptionType"`
-	KMSContext     string           `xml:"KMSContext,omitempty"`
-	KMSKeyID       string           `xml:"KMSKeyId,omitempty"`
+	EncryptionType sse.Algorithm `xml:"EncryptionType"`
+	KMSContext     string        `xml:"KMSContext,omitempty"`
+	KMSKeyID       string        `xml:"KMSKeyId,omitempty"`
 }
 
 // MetadataEntry denotes name and value.
@@ -528,7 +580,7 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 
 	if rreq.Type == SelectRestoreRequest {
 		for _, v := range rreq.OutputLocation.S3.UserMetadata {
-			if !strings.HasPrefix("x-amz-meta", strings.ToLower(v.Name)) {
+			if !strings.HasPrefix(strings.ToLower(v.Name), "x-amz-meta") {
 				meta["x-amz-meta-"+v.Name] = v.Value
 				continue
 			}
@@ -695,17 +747,16 @@ func isRestoredObjectOnDisk(meta map[string]string) (onDisk bool) {
 // ToLifecycleOpts returns lifecycle.ObjectOpts value for oi.
 func (oi ObjectInfo) ToLifecycleOpts() lifecycle.ObjectOpts {
 	return lifecycle.ObjectOpts{
-		Name:                   oi.Name,
-		UserTags:               oi.UserTags,
-		VersionID:              oi.VersionID,
-		ModTime:                oi.ModTime,
-		IsLatest:               oi.IsLatest,
-		NumVersions:            oi.NumVersions,
-		DeleteMarker:           oi.DeleteMarker,
-		SuccessorModTime:       oi.SuccessorModTime,
-		RestoreOngoing:         oi.RestoreOngoing,
-		RestoreExpires:         oi.RestoreExpires,
-		TransitionStatus:       oi.TransitionedObject.Status,
-		RemoteTiersImmediately: globalDebugRemoteTiersImmediately,
+		Name:             oi.Name,
+		UserTags:         oi.UserTags,
+		VersionID:        oi.VersionID,
+		ModTime:          oi.ModTime,
+		IsLatest:         oi.IsLatest,
+		NumVersions:      oi.NumVersions,
+		DeleteMarker:     oi.DeleteMarker,
+		SuccessorModTime: oi.SuccessorModTime,
+		RestoreOngoing:   oi.RestoreOngoing,
+		RestoreExpires:   oi.RestoreExpires,
+		TransitionStatus: oi.TransitionedObject.Status,
 	}
 }

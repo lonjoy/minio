@@ -13,8 +13,8 @@ clusterDomain: cluster.local
 ## Set default image, imageTag, and imagePullPolicy. mode is used to indicate the
 ##
 image:
-  repository: minio/minio
-  tag: RELEASE.2021-08-20T18-32-01Z
+  repository: quay.io/minio/minio
+  tag: RELEASE.2021-11-24T23-19-33Z
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -24,14 +24,16 @@ imagePullSecrets: []
 ## client used to create a default bucket).
 ##
 mcImage:
-  repository: minio/mc
-  tag: RELEASE.2021-07-27T06-46-19Z
+  repository: quay.io/minio/mc
+  tag: RELEASE.2021-11-16T20-37-36Z
   pullPolicy: IfNotPresent
 
-## minio server mode, i.e. standalone or distributed.
+## minio mode, i.e. standalone or distributed or gateway (nas)
 ## Distributed MinIO ref: https://docs.minio.io/docs/distributed-minio-quickstart-guide
-##
+## NAS Gateway MinIO ref: https://docs.min.io/docs/minio-gateway-for-nas.html
 mode: distributed
+
+## NOTE: currently only "nas" gateway is supported.
 
 ## Additional labels to include with deployment or statefulset
 additionalLabels: []
@@ -97,9 +99,14 @@ bucketRoot: ""
 # Number of drives attached to a node
 drivesPerNode: 1
 # Number of MinIO containers running
-replicas: 4
+replicas: 16
 # Number of expanded MinIO clusters
-zones: 1
+pools: 1
+
+# Deploy if 'mode == gateway' - 4 replicas.
+gateway:
+  type: "nas" # currently only "nas" is supported.
+  replicas: 4
 
 ## TLS Settings for MinIO
 tls:
@@ -162,6 +169,7 @@ service:
 
 ingress:
   enabled: false
+  # ingressClassName: ""
   labels: {}
     # node-role.kubernetes.io/ingress: platform
 
@@ -190,6 +198,7 @@ consoleService:
 
 consoleIngress:
   enabled: false
+  # ingressClassName: ""
   labels: {}
     # node-role.kubernetes.io/ingress: platform
 
@@ -249,6 +258,7 @@ users:
     secretKey: console123
     policy: consoleAdmin
 
+
 ## Additional Annotations for the Kubernetes Job makeUserJob
 makeUserJob:
   podAnnotations:
@@ -261,6 +271,9 @@ makeUserJob:
   resources:
     requests:
       memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 ## List of buckets to be created after minio install
 ##
@@ -292,6 +305,9 @@ makeBucketJob:
   resources:
     requests:
       memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 ## Use this field to add environment variables relevant to MinIO server. These fields will be passed on to MinIO container(s)
 ## when Chart is deployed
@@ -310,3 +326,20 @@ networkPolicy:
 podDisruptionBudget:
   enabled: false
   maxUnavailable: 1
+
+## Specify the service account to use for the Minio pods. If 'create' is set to 'false'
+## and 'name' is left unspecified, the account 'default' will be used.
+serviceAccount:
+  create: true
+  ## The name of the service account to use. If 'create' is 'true', a service account with that name
+  ## will be created.
+  name: "minio-sa"
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    additionalLabels: {}
+    public: true
+    # namespace: monitoring
+    # interval: 30s
+    # scrapeTimeout: 10s

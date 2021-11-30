@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -150,32 +151,44 @@ func (z *erasureServerPools) GetDisksID(ids ...string) []StorageAPI {
 // GetRawData will return all files with a given raw path to the callback.
 // Errors are ignored, only errors from the callback are returned.
 // For now only direct file paths are supported.
-func (z *erasureServerPools) GetRawData(ctx context.Context, volume, file string, fn func(r io.Reader, host string, disk string, filename string, size int64, modtime time.Time) error) error {
+func (z *erasureServerPools) GetRawData(ctx context.Context, volume, file string, fn func(r io.Reader, host string, disk string, filename string, info StatInfo) error) error {
+	found := 0
 	for _, s := range z.serverPools {
 		for _, disks := range s.erasureDisks {
 			for i, disk := range disks {
 				if disk == OfflineDisk {
 					continue
 				}
-				si, err := disk.StatInfoFile(ctx, volume, file)
+				stats, err := disk.StatInfoFile(ctx, volume, file, true)
 				if err != nil {
 					continue
 				}
-				r, err := disk.ReadFileStream(ctx, volume, file, 0, si.Size)
-				if err != nil {
-					continue
-				}
-				defer r.Close()
 				did, err := disk.GetDiskID()
 				if err != nil {
 					did = fmt.Sprintf("disk-%d", i)
 				}
-				err = fn(r, disk.Hostname(), did, pathJoin(volume, file), si.Size, si.ModTime)
-				if err != nil {
-					return err
+				for _, si := range stats {
+					found++
+					var r io.ReadCloser
+					if !si.Dir {
+						r, err = disk.ReadFileStream(ctx, volume, si.Name, 0, si.Size)
+						if err != nil {
+							continue
+						}
+					} else {
+						r = io.NopCloser(bytes.NewBuffer([]byte{}))
+					}
+					err = fn(r, disk.Hostname(), did, pathJoin(volume, si.Name), si)
+					r.Close()
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
+	}
+	if found == 0 {
+		return errFileNotFound
 	}
 	return nil
 }
@@ -339,6 +352,22 @@ func (z *erasureServerPools) getPoolIdxExisting(ctx context.Context, bucket, obj
 	return z.getPoolIdxExistingWithOpts(ctx, bucket, object, ObjectOptions{})
 }
 
+func (z *erasureServerPools) getPoolIdxNoLock(ctx context.Context, bucket, object string, size int64) (idx int, err error) {
+	idx, err = z.getPoolIdxExistingNoLock(ctx, bucket, object)
+	if err != nil && !isErrObjectNotFound(err) {
+		return idx, err
+	}
+
+	if isErrObjectNotFound(err) {
+		idx = z.getAvailablePoolIdx(ctx, bucket, object, size)
+		if idx < 0 {
+			return -1, toObjectErr(errDiskFull)
+		}
+	}
+
+	return idx, nil
+}
+
 // getPoolIdx returns the found previous object and its corresponding pool idx,
 // if none are found falls back to most available space pool.
 func (z *erasureServerPools) getPoolIdx(ctx context.Context, bucket, object string, size int64) (idx int, err error) {
@@ -456,7 +485,7 @@ func (z *erasureServerPools) StorageInfo(ctx context.Context) (StorageInfo, []er
 	return storageInfo, errs
 }
 
-func (z *erasureServerPools) NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- madmin.DataUsageInfo) error {
+func (z *erasureServerPools) NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo, wantCycle uint32) error {
 	// Updates must be closed before we return.
 	defer close(updates)
 
@@ -474,7 +503,7 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, bf *bloomFilter, upd
 	}
 
 	if len(allBuckets) == 0 {
-		updates <- madmin.DataUsageInfo{} // no buckets found update data usage to reflect latest state
+		updates <- DataUsageInfo{} // no buckets found update data usage to reflect latest state
 		return nil
 	}
 
@@ -501,7 +530,7 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, bf *bloomFilter, upd
 					}
 				}()
 				// Start scanner. Blocks until done.
-				err := erObj.nsScanner(ctx, allBuckets, bf, updates)
+				err := erObj.nsScanner(ctx, allBuckets, bf, wantCycle, updates)
 				if err != nil {
 					logger.LogIf(ctx, err)
 					mu.Lock()
@@ -603,6 +632,10 @@ func (z *erasureServerPools) MakeBucketWithLocation(ctx context.Context, bucket 
 	// Return the first encountered error
 	for _, err := range errs {
 		if err != nil {
+			if _, ok := err.(BucketExists); !ok {
+				// Delete created buckets, ignoring errors.
+				z.DeleteBucket(context.Background(), bucket, DeleteBucketOptions{Force: true, NoRecreate: true})
+			}
 			return err
 		}
 	}
@@ -614,7 +647,7 @@ func (z *erasureServerPools) MakeBucketWithLocation(ctx context.Context, bucket 
 		meta.ObjectLockConfigXML = enabledBucketObjectLockConfig
 	}
 
-	if err := meta.Save(ctx, z); err != nil {
+	if err := meta.Save(context.Background(), z); err != nil {
 		return toObjectErr(err, bucket)
 	}
 
@@ -791,7 +824,7 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 		return z.serverPools[0].PutObject(ctx, bucket, object, data, opts)
 	}
 	if !opts.NoLock {
-		ns := z.NewNSLock(minioMetaMultipartBucket, pathJoin(bucket, object, "newMultipartObject.lck"))
+		ns := z.NewNSLock(bucket, object)
 		lkctx, err := ns.GetLock(ctx, globalOperationTimeout)
 		if err != nil {
 			return ObjectInfo{}, err
@@ -801,7 +834,7 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 		opts.NoLock = true
 	}
 
-	idx, err := z.getPoolIdx(ctx, bucket, object, data.Size())
+	idx, err := z.getPoolIdxNoLock(ctx, bucket, object, data.Size())
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -867,7 +900,11 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 	defer multiDeleteLock.Unlock(lkctx.Cancel)
 
 	if z.SinglePool() {
-		return z.serverPools[0].DeleteObjects(ctx, bucket, objects, opts)
+		deleteObjects, dErrs := z.serverPools[0].DeleteObjects(ctx, bucket, objects, opts)
+		for i := range deleteObjects {
+			deleteObjects[i].ObjectName = decodeDirObject(deleteObjects[i].ObjectName)
+		}
+		return deleteObjects, dErrs
 	}
 
 	// Fetch location of up to 10 objects concurrently.
@@ -876,20 +913,14 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 
 	var mu sync.Mutex
 	eg := errgroup.WithNErrs(len(objects)).WithConcurrency(10)
-	cctx, cancel := eg.WithCancelOnError(ctx)
-	defer cancel()
 	for j, obj := range objects {
 		j := j
 		obj := obj
 		eg.Go(func() error {
-			idx, err := z.getPoolIdxExistingNoLock(cctx, bucket, obj.ObjectName)
-			if isErrObjectNotFound(err) {
+			idx, err := z.getPoolIdxExistingNoLock(ctx, bucket, obj.ObjectName)
+			if err != nil {
 				derrs[j] = err
 				return nil
-			}
-			if err != nil {
-				// unhandled errors return right here.
-				return err
 			}
 			mu.Lock()
 			poolObjIdxMap[idx] = append(poolObjIdxMap[idx], obj)
@@ -899,12 +930,7 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 		}, j)
 	}
 
-	if err := eg.WaitErr(); err != nil {
-		for i := range derrs {
-			derrs[i] = err
-		}
-		return dobjects, derrs
-	}
+	eg.Wait() // wait to check all the pools.
 
 	// Delete concurrently in all server pools.
 	var wg sync.WaitGroup
@@ -921,6 +947,7 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 					if derr != nil {
 						derrs[orgIndexes[i]] = derr
 					}
+					deletedObjects[i].ObjectName = decodeDirObject(deletedObjects[i].ObjectName)
 					dobjects[orgIndexes[i]] = deletedObjects[i]
 				}
 				mu.Unlock()
@@ -939,7 +966,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 	cpSrcDstSame := isStringEqual(pathJoin(srcBucket, srcObject), pathJoin(dstBucket, dstObject))
 
 	if !dstOpts.NoLock {
-		ns := z.NewNSLock(minioMetaMultipartBucket, pathJoin(dstBucket, dstObject, "newMultipartObject.lck"))
+		ns := z.NewNSLock(dstBucket, dstObject)
 		lkctx, err := ns.GetLock(ctx, globalOperationTimeout)
 		if err != nil {
 			return ObjectInfo{}, err
@@ -949,7 +976,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		dstOpts.NoLock = true
 	}
 
-	poolIdx, err := z.getPoolIdx(ctx, dstBucket, dstObject, srcInfo.Size)
+	poolIdx, err := z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)
 	if err != nil {
 		return objInfo, err
 	}
@@ -982,6 +1009,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		Versioned:            dstOpts.Versioned,
 		VersionID:            dstOpts.VersionID,
 		MTime:                dstOpts.MTime,
+		NoLock:               true,
 	}
 
 	return z.serverPools[poolIdx].PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)
@@ -1162,14 +1190,6 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 		return z.serverPools[0].NewMultipartUpload(ctx, bucket, object, opts)
 	}
 
-	ns := z.NewNSLock(minioMetaMultipartBucket, pathJoin(bucket, object, "newMultipartObject.lck"))
-	lkctx, err := ns.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		return "", err
-	}
-	ctx = lkctx.Context()
-	defer ns.Unlock(lkctx.Cancel)
-
 	for idx, pool := range z.serverPools {
 		result, err := pool.ListMultipartUploads(ctx, bucket, object, "", "", "", maxUploadsList)
 		if err != nil {
@@ -1183,6 +1203,8 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 		}
 	}
 
+	// any parallel writes on the object will block for this poolIdx
+	// to return since this holds a read lock on the namespace.
 	idx, err := z.getPoolIdx(ctx, bucket, object, -1)
 	if err != nil {
 		return "", err
@@ -1400,14 +1422,14 @@ func (z *erasureServerPools) IsTaggingSupported() bool {
 // DeleteBucket - deletes a bucket on all serverPools simultaneously,
 // even if one of the serverPools fail to delete buckets, we proceed to
 // undo a successful operation.
-func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, opts DeleteBucketOptions) error {
 	g := errgroup.WithNErrs(len(z.serverPools))
 
 	// Delete buckets in parallel across all serverPools.
 	for index := range z.serverPools {
 		index := index
 		g.Go(func() error {
-			return z.serverPools[index].DeleteBucket(ctx, bucket, forceDelete)
+			return z.serverPools[index].DeleteBucket(ctx, bucket, opts)
 		}, index)
 	}
 
@@ -1417,14 +1439,15 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, fo
 	// buckets operation by creating all the buckets again.
 	for _, err := range errs {
 		if err != nil {
-			if !z.SinglePool() {
-				undoDeleteBucketServerPools(ctx, bucket, z.serverPools, errs)
+			if !z.SinglePool() && !opts.NoRecreate {
+				undoDeleteBucketServerPools(context.Background(), bucket, z.serverPools, errs)
 			}
 			return err
 		}
 	}
 
-	deleteBucketMetadata(ctx, z, bucket)
+	// Purge the entire bucket metadata entirely.
+	z.renameAll(context.Background(), minioMetaBucket, pathJoin(bucketMetaPrefix, bucket))
 
 	// Success.
 	return nil
@@ -1537,7 +1560,7 @@ func (z *erasureServerPools) HealBucket(ctx context.Context, bucket string, opts
 	}
 
 	// Attempt heal on the bucket metadata, ignore any failures
-	_, _ = z.HealObject(ctx, minioMetaBucket, pathJoin(bucketConfigPrefix, bucket, bucketMetadataFile), "", opts)
+	defer z.HealObject(ctx, minioMetaBucket, pathJoin(bucketConfigPrefix, bucket, bucketMetadataFile), "", opts)
 
 	for _, pool := range z.serverPools {
 		result, err := pool.HealBucket(ctx, bucket, opts)
@@ -1569,51 +1592,82 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 		return err
 	}
 
-	if opts.WalkVersions {
-		go func() {
-			defer close(results)
-
-			var marker, versionIDMarker string
-			for {
-				loi, err := z.ListObjectVersions(ctx, bucket, prefix, marker, versionIDMarker, "", 1000)
-				if err != nil {
-					break
-				}
-
-				for _, obj := range loi.Objects {
-					results <- obj
-				}
-
-				if !loi.IsTruncated {
-					break
-				}
-
-				marker = loi.NextMarker
-				versionIDMarker = loi.NextVersionIDMarker
-			}
-		}()
-		return nil
-	}
-
+	ctx, cancel := context.WithCancel(ctx)
 	go func() {
+		defer cancel()
 		defer close(results)
 
-		var marker string
-		for {
-			loi, err := z.ListObjects(ctx, bucket, prefix, marker, "", 1000)
-			if err != nil {
-				break
-			}
+		for _, erasureSet := range z.serverPools {
+			var wg sync.WaitGroup
+			for _, set := range erasureSet.sets {
+				set := set
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
 
-			for _, obj := range loi.Objects {
-				results <- obj
-			}
+					disks, _ := set.getOnlineDisksWithHealing()
+					if len(disks) == 0 {
+						cancel()
+						return
+					}
 
-			if !loi.IsTruncated {
-				break
-			}
+					loadEntry := func(entry metaCacheEntry) {
+						if entry.isDir() {
+							return
+						}
 
-			marker = loi.NextMarker
+						fivs, err := entry.fileInfoVersions(bucket)
+						if err != nil {
+							cancel()
+							return
+						}
+
+						for _, version := range fivs.Versions {
+							results <- version.ToObjectInfo(bucket, version.Name)
+						}
+					}
+
+					// How to resolve partial results.
+					resolver := metadataResolutionParams{
+						dirQuorum: 1,
+						objQuorum: 1,
+						bucket:    bucket,
+					}
+
+					path := baseDirFromPrefix(prefix)
+					if path == "" {
+						path = prefix
+					}
+
+					lopts := listPathRawOptions{
+						disks:          disks,
+						bucket:         bucket,
+						path:           path,
+						recursive:      true,
+						forwardTo:      "",
+						minDisks:       1,
+						reportNotFound: false,
+						agreed:         loadEntry,
+						partial: func(entries metaCacheEntries, nAgreed int, errs []error) {
+							entry, ok := entries.resolve(&resolver)
+							if !ok {
+								// check if we can get one entry atleast
+								// proceed to heal nonetheless.
+								entry, _ = entries.firstFound()
+							}
+
+							loadEntry(*entry)
+						},
+						finished: nil,
+					}
+
+					if err := listPathRaw(ctx, lopts); err != nil {
+						logger.LogIf(ctx, fmt.Errorf("listPathRaw returned %w: opts(%#v)", err, lopts))
+						return
+					}
+				}()
+			}
+			wg.Wait()
 		}
 	}()
 
@@ -1640,8 +1694,8 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 
 					disks, _ := set.getOnlineDisksWithHealing()
 					if len(disks) == 0 {
-						errCh <- errors.New("HealObjects: No non-healing disks found")
 						cancel()
+						errCh <- errors.New("HealObjects: No non-healing disks found")
 						return
 					}
 
@@ -1668,15 +1722,18 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 						}
 						fivs, err := entry.fileInfoVersions(bucket)
 						if err != nil {
-							errCh <- err
-							cancel()
+							if err := healObject(bucket, entry.name, ""); err != nil {
+								cancel()
+								errCh <- err
+								return
+							}
 							return
 						}
-						waitForLowHTTPReq(globalHealConfig.IOCount, globalHealConfig.Sleep)
+
 						for _, version := range fivs.Versions {
 							if err := healObject(bucket, version.Name, version.VersionID); err != nil {
-								errCh <- err
 								cancel()
+								errCh <- err
 								return
 							}
 						}
@@ -1705,15 +1762,20 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 						agreed:         healEntry,
 						partial: func(entries metaCacheEntries, nAgreed int, errs []error) {
 							entry, ok := entries.resolve(&resolver)
-							if ok {
-								healEntry(*entry)
+							if !ok {
+								// check if we can get one entry atleast
+								// proceed to heal nonetheless.
+								entry, _ = entries.firstFound()
 							}
+
+							healEntry(*entry)
 						},
 						finished: nil,
 					}
+
 					if err := listPathRaw(ctx, lopts); err != nil {
-						errCh <- fmt.Errorf("listPathRaw returned %w: opts(%#v)", err, lopts)
 						cancel()
+						errCh <- fmt.Errorf("listPathRaw returned %w: opts(%#v)", err, lopts)
 						return
 					}
 				}()
@@ -1731,9 +1793,6 @@ func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, ver
 		result, err := pool.HealObject(ctx, bucket, object, versionID, opts)
 		result.Object = decodeDirObject(result.Object)
 		if err != nil {
-			if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
-				continue
-			}
 			return result, err
 		}
 		return result, nil

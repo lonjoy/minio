@@ -68,14 +68,15 @@ const (
 
 )
 
-// isEncryptedMultipart returns true if the current object is
+// isMultipart returns true if the current object is
 // uploaded by the user using multipart mechanism:
 // initiate new multipart, upload part, complete upload
-func (o *ObjectInfo) isEncryptedMultipart() bool {
+func (o *ObjectInfo) isMultipart() bool {
 	if len(o.Parts) == 0 {
 		return false
 	}
-	if !crypto.IsMultiPart(o.UserDefined) {
+	_, encrypted := crypto.IsEncrypted(o.UserDefined)
+	if encrypted && !crypto.IsMultiPart(o.UserDefined) {
 		return false
 	}
 	for _, part := range o.Parts {
@@ -427,7 +428,7 @@ func DecryptBlocksRequestR(inputReader io.Reader, h http.Header, seqNumber uint3
 
 	bucket, object := oi.Bucket, oi.Name
 	// Single part case
-	if !oi.isEncryptedMultipart() {
+	if !oi.isMultipart() {
 		var reader io.Reader
 		var err error
 		if copySource {
@@ -589,7 +590,7 @@ func (o *ObjectInfo) DecryptedSize() (int64, error) {
 	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
 		return 0, errors.New("Cannot compute decrypted size of an unencrypted object")
 	}
-	if !o.isEncryptedMultipart() {
+	if !o.isMultipart() {
 		size, err := sio.DecryptedSize(uint64(o.Size))
 		if err != nil {
 			err = errObjectTampered // assign correct error type
@@ -732,7 +733,7 @@ func (o *ObjectInfo) GetDecryptedRange(rs *HTTPRangeSpec) (encOff, encLength, sk
 	// Assemble slice of (decrypted) part sizes in `sizes`
 	var sizes []int64
 	var decObjSize int64 // decrypted total object size
-	if o.isEncryptedMultipart() {
+	if o.isMultipart() {
 		sizes = make([]int64, len(o.Parts))
 		for i, part := range o.Parts {
 			var partSize uint64

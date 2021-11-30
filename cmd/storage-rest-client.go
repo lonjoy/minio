@@ -23,6 +23,7 @@ import (
 	"encoding/gob"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/url"
@@ -377,6 +378,10 @@ func (client *storageRESTClient) CreateFile(ctx context.Context, volume, path st
 	values.Set(storageRESTLength, strconv.Itoa(int(size)))
 	respBody, err := client.call(ctx, storageRESTMethodCreateFile, values, ioutil.NopCloser(reader), size)
 	defer xhttp.DrainBody(respBody)
+	if err != nil {
+		return err
+	}
+	_, err = waitForHTTPResponse(respBody)
 	return err
 }
 
@@ -585,7 +590,7 @@ func (client *storageRESTClient) Delete(ctx context.Context, volume string, path
 }
 
 // DeleteVersions - deletes list of specified versions if present
-func (client *storageRESTClient) DeleteVersions(ctx context.Context, volume string, versions []FileInfo) (errs []error) {
+func (client *storageRESTClient) DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions) (errs []error) {
 	if len(versions) == 0 {
 		return errs
 	}
@@ -676,10 +681,11 @@ func (client *storageRESTClient) VerifyFile(ctx context.Context, volume, path st
 	return toStorageErr(verifyResp.Err)
 }
 
-func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path string) (stat StatInfo, err error) {
+func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error) {
 	values := make(url.Values)
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
+	values.Set(storageRESTGlob, fmt.Sprint(glob))
 	respBody, err := client.call(ctx, storageRESTMethodStatInfoFile, values, nil, -1)
 	if err != nil {
 		return stat, err
@@ -689,7 +695,19 @@ func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path 
 	if err != nil {
 		return stat, err
 	}
-	err = stat.DecodeMsg(msgpNewReader(respReader))
+	rd := msgpNewReader(respReader)
+	for {
+		var st StatInfo
+		err = st.DecodeMsg(rd)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			break
+		}
+		stat = append(stat, st)
+	}
+
 	return stat, err
 }
 
@@ -707,11 +725,11 @@ func newStorageRESTClient(endpoint Endpoint, healthcheck bool) *storageRESTClien
 		Path:   path.Join(storageRESTPrefix, endpoint.Path, storageRESTVersion),
 	}
 
-	restClient := rest.NewClient(serverURL, globalInternodeTransport, newAuthToken)
+	restClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
 
 	if healthcheck {
 		// Use a separate client to avoid recursive calls.
-		healthClient := rest.NewClient(serverURL, globalInternodeTransport, newAuthToken)
+		healthClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
 		healthClient.ExpectTimeouts = true
 		healthClient.NoMetrics = true
 		restClient.HealthCheckFn = func() bool {

@@ -291,6 +291,13 @@ func (e MethodNotAllowed) Error() string {
 	return "Method not allowed: " + e.Bucket + "/" + e.Object
 }
 
+// ObjectLocked object is currently WORM protected.
+type ObjectLocked GenericError
+
+func (e ObjectLocked) Error() string {
+	return "Object is WORM protected and cannot be overwritten: " + e.Bucket + "/" + e.Object + "(" + e.VersionID + ")"
+}
+
 // ObjectAlreadyExists object already exists.
 type ObjectAlreadyExists GenericError
 
@@ -305,7 +312,7 @@ func (e ObjectExistsAsDirectory) Error() string {
 	return "Object exists on : " + e.Bucket + " as directory " + e.Object
 }
 
-//PrefixAccessDenied object access is denied.
+// PrefixAccessDenied object access is denied.
 type PrefixAccessDenied GenericError
 
 func (e PrefixAccessDenied) Error() string {
@@ -400,13 +407,6 @@ func (e BucketRemoteDestinationNotFound) Error() string {
 	return "Destination bucket does not exist: " + e.Bucket
 }
 
-// BucketReplicationDestinationMissingLock bucket does not have object lock enabled.
-type BucketReplicationDestinationMissingLock GenericError
-
-func (e BucketReplicationDestinationMissingLock) Error() string {
-	return "Destination bucket does not have object lock enabled: " + e.Bucket
-}
-
 // BucketRemoteTargetNotFound remote target does not exist.
 type BucketRemoteTargetNotFound GenericError
 
@@ -484,7 +484,7 @@ func (e InvalidObjectState) Error() string {
 	return "The operation is not valid for the current state of the object " + e.Bucket + "/" + e.Object + "(" + e.VersionID + ")"
 }
 
-/// Bucket related errors.
+// Bucket related errors.
 
 // BucketNameInvalid - bucketname provided is invalid.
 type BucketNameInvalid GenericError
@@ -494,7 +494,7 @@ func (e BucketNameInvalid) Error() string {
 	return "Bucket name invalid: " + e.Bucket
 }
 
-/// Object related errors.
+// Object related errors.
 
 // ObjectNameInvalid - object name provided is invalid.
 type ObjectNameInvalid GenericError
@@ -569,7 +569,7 @@ func (e OperationTimedOut) Error() string {
 	return "Operation timed out"
 }
 
-/// Multipart related errors.
+// Multipart related errors.
 
 // MalformedUploadID malformed upload id.
 type MalformedUploadID struct {
@@ -645,10 +645,12 @@ func (e UnsupportedMetadata) Error() string {
 }
 
 // BackendDown is returned for network errors or if the gateway's backend is down.
-type BackendDown struct{}
+type BackendDown struct {
+	Err string
+}
 
 func (e BackendDown) Error() string {
-	return "Backend down"
+	return e.Err
 }
 
 // isErrBucketNotFound - Check if error type is BucketNotFound.

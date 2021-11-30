@@ -29,7 +29,7 @@ import (
 	iampolicy "github.com/minio/pkg/iam/policy"
 )
 
-func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Request, action iampolicy.AdminAction) (ObjectLayer, auth.Credentials) {
+func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Request, actions ...iampolicy.AdminAction) (ObjectLayer, auth.Credentials) {
 	// Get current object layer instance.
 	objectAPI := newObjectLayerFn()
 	if objectAPI == nil || globalNotificationSys == nil {
@@ -37,14 +37,17 @@ func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Reques
 		return nil, auth.Credentials{}
 	}
 
-	// Validate request signature.
-	cred, adminAPIErr := checkAdminRequestAuth(ctx, r, action, "")
-	if adminAPIErr != ErrNone {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
-		return nil, cred
+	for _, action := range actions {
+		// Validate request signature.
+		cred, adminAPIErr := checkAdminRequestAuth(ctx, r, action, "")
+		if adminAPIErr != ErrNone {
+			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
+			return nil, cred
+		}
+		return objectAPI, cred
 	}
-
-	return objectAPI, cred
+	writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+	return nil, auth.Credentials{}
 }
 
 // AdminError - is a generic error for all admin APIs.
@@ -102,6 +105,12 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 				Code:           "XMinioIAMNotInitialized",
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusServiceUnavailable,
+			}
+		case errors.Is(err, errPolicyInUse):
+			apiErr = APIError{
+				Code:           "XMinioAdminPolicyInUse",
+				Description:    "The policy cannot be removed, as it is in use",
+				HTTPStatusCode: http.StatusBadRequest,
 			}
 		case errors.Is(err, kes.ErrKeyExists):
 			apiErr = APIError{

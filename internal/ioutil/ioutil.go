@@ -24,6 +24,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/minio/minio/internal/disk"
@@ -135,7 +136,7 @@ func (w *LimitWriter) Write(p []byte) (n int, err error) {
 	var n1 int
 	if w.skipBytes > 0 {
 		if w.skipBytes >= int64(len(p)) {
-			w.skipBytes = w.skipBytes - int64(len(p))
+			w.skipBytes -= int64(len(p))
 			return n, nil
 		}
 		p = p[w.skipBytes:]
@@ -146,11 +147,11 @@ func (w *LimitWriter) Write(p []byte) (n int, err error) {
 	}
 	if w.wLimit < int64(len(p)) {
 		n1, err = w.Writer.Write(p[:w.wLimit])
-		w.wLimit = w.wLimit - int64(n1)
+		w.wLimit -= int64(n1)
 		return n, err
 	}
 	n1, err = w.Writer.Write(p)
-	w.wLimit = w.wLimit - int64(n1)
+	w.wLimit -= int64(n1)
 	return n, err
 }
 
@@ -210,6 +211,22 @@ func NewSkipReader(r io.Reader, n int64) io.Reader {
 	return &SkipReader{r, n}
 }
 
+var copyBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
+// Copy is exactly like io.Copy but with re-usable buffers.
+func Copy(dst io.Writer, src io.Reader) (written int64, err error) {
+	bufp := copyBufPool.Get().(*[]byte)
+	buf := *bufp
+	defer copyBufPool.Put(bufp)
+
+	return io.CopyBuffer(dst, src, buf)
+}
+
 // SameFile returns if the files are same.
 func SameFile(fi1, fi2 os.FileInfo) bool {
 	if !os.SameFile(fi1, fi2) {
@@ -227,9 +244,9 @@ func SameFile(fi1, fi2 os.FileInfo) bool {
 	return true
 }
 
-// DirectIO alignment needs to be 4K. Defined here as
+// DirectioAlignSize - DirectIO alignment needs to be 4K. Defined here as
 // directio.AlignSize is defined as 0 in MacOS causing divide by 0 error.
-const directioAlignSize = 4096
+const DirectioAlignSize = 4096
 
 // CopyAligned - copies from reader to writer using the aligned input
 // buffer, it is expected that input buffer is page aligned to
@@ -250,6 +267,7 @@ func CopyAligned(w *os.File, r io.Reader, alignedBuf []byte, totalSize int64) (i
 		if err = disk.DisableDirectIO(w); err != nil {
 			return remainingWritten, err
 		}
+		// Since w is *os.File io.Copy shall use ReadFrom() call.
 		return io.Copy(w, bytes.NewReader(buf))
 	}
 
@@ -269,7 +287,7 @@ func CopyAligned(w *os.File, r io.Reader, alignedBuf []byte, totalSize int64) (i
 		}
 		buf = buf[:nr]
 		var nw int64
-		if len(buf)%directioAlignSize == 0 {
+		if len(buf)%DirectioAlignSize == 0 {
 			var n int
 			// buf is aligned for directio write()
 			n, err = w.Write(buf)

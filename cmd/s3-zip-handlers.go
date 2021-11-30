@@ -20,16 +20,17 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
-	stdioutil "io/ioutil"
+	"io/ioutil"
 	"net/http"
 	"sort"
 	"strings"
 
 	"github.com/minio/minio/internal/crypto"
-	"github.com/minio/minio/internal/ioutil"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/bucket/policy"
 	xnet "github.com/minio/pkg/net"
@@ -142,8 +143,15 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 	var zipInfo []byte
 
 	if z, ok := zipObjInfo.UserDefined[archiveInfoMetadataKey]; ok {
-		zipInfo = []byte(z)
-	} else {
+		if globalIsErasure {
+			zipInfo = []byte(z)
+		} else {
+			zipInfo, err = base64.StdEncoding.DecodeString(z)
+			logger.LogIf(ctx, err)
+			// Will attempt to re-read...
+		}
+	}
+	if len(zipInfo) == 0 {
 		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, opts)
 	}
 
@@ -151,7 +159,6 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
-
 	file, err := zipindex.FindSerialized(zipInfo, object)
 	if err != nil {
 		if err == io.EOF {
@@ -173,7 +180,8 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 	var rc io.ReadCloser
 
 	if file.UncompressedSize64 > 0 {
-		rs := &HTTPRangeSpec{Start: file.Offset, End: file.Offset + int64(file.UncompressedSize64) - 1}
+		// We do not know where the file ends, but the returned reader only returns UncompressedSize.
+		rs := &HTTPRangeSpec{Start: file.Offset, End: -1}
 		gr, err := objectAPI.GetObjectNInfo(ctx, bucket, zipPath, rs, nil, readLock, opts)
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -186,7 +194,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 			return
 		}
 	} else {
-		rc = stdioutil.NopCloser(bytes.NewReader([]byte{}))
+		rc = ioutil.NopCloser(bytes.NewReader([]byte{}))
 	}
 
 	defer rc.Close()
@@ -198,10 +206,10 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	setHeadGetRespHeaders(w, r.Form)
 
-	httpWriter := ioutil.WriteOnClose(w)
+	httpWriter := xioutil.WriteOnClose(w)
 
 	// Write object content to response body
-	if _, err = io.Copy(httpWriter, rc); err != nil {
+	if _, err = xioutil.Copy(httpWriter, rc); err != nil {
 		if !httpWriter.HasWritten() {
 			// write error response only if no data or headers has been written to client yet
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -323,7 +331,7 @@ func getFilesListFromZIPObject(ctx context.Context, objectAPI ObjectLayer, bucke
 		if err != nil {
 			return nil, ObjectInfo{}, err
 		}
-		b, err := stdioutil.ReadAll(gr)
+		b, err := ioutil.ReadAll(gr)
 		if err != nil {
 			gr.Close()
 			return nil, ObjectInfo{}, err
@@ -490,7 +498,11 @@ func updateObjectMetadataWithZipInfo(ctx context.Context, objectAPI ObjectLayer,
 	}
 
 	srcInfo.UserDefined[archiveTypeMetadataKey] = archiveType
-	srcInfo.UserDefined[archiveInfoMetadataKey] = string(zipInfo)
+	if globalIsErasure {
+		srcInfo.UserDefined[archiveInfoMetadataKey] = string(zipInfo)
+	} else {
+		srcInfo.UserDefined[archiveInfoMetadataKey] = base64.StdEncoding.EncodeToString(zipInfo)
+	}
 	srcInfo.metadataOnly = true
 
 	// Always update the same version id & modtime

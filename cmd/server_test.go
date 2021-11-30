@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -141,7 +142,7 @@ func TestServerSuite(t *testing.T) {
 }
 
 // Setting up the test suite.
-// Starting the Test server with temporary FS backend.
+// Starting the Test server with temporary backend.
 func (s *TestSuiteCommon) SetUpSuite(c *check) {
 	if s.secure {
 		cert, key, err := generateTLSCertKey("127.0.0.1")
@@ -158,7 +159,27 @@ func (s *TestSuiteCommon) SetUpSuite(c *check) {
 	s.secretKey = s.testServer.SecretKey
 }
 
-// Called implicitly by "gopkg.in/check.v1" after all tests are run.
+func (s *TestSuiteCommon) RestartTestServer(c *check) {
+	// Shutdown.
+	s.testServer.cancel()
+	s.testServer.Server.Close()
+	s.testServer.Obj.Shutdown(context.Background())
+
+	// Restart.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s.testServer.cancel = cancel
+	s.testServer = initTestServerWithBackend(ctx, c, s.testServer, s.testServer.Obj, s.testServer.rawDiskPaths)
+	if s.secure {
+		s.testServer.Server.StartTLS()
+	} else {
+		s.testServer.Server.Start()
+	}
+
+	s.client = s.testServer.Server.Client()
+	s.endPoint = s.testServer.Server.URL
+}
+
 func (s *TestSuiteCommon) TearDownSuite(c *check) {
 	s.testServer.Stop()
 }
@@ -344,7 +365,7 @@ func (s *TestSuiteCommon) TestBucketPolicy(c *check) {
 	// assert the http response status code.
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	/// Put a new bucket policy.
+	// Put a new bucket policy.
 	request, err = newTestSignedRequest(http.MethodPut, getPutPolicyURL(s.endPoint, bucketName),
 		int64(len(bucketPolicyStr)), bytes.NewReader([]byte(bucketPolicyStr)), s.accessKey, s.secretKey, s.signer)
 	c.Assert(err, nil)
@@ -959,7 +980,7 @@ func (s *TestSuiteCommon) TestPutBucket(c *check) {
 	wg.Wait()
 
 	bucketName = getRandomBucketName()
-	//Block 2: testing for correctness of the functionality
+	// Block 2: testing for correctness of the functionality
 	// HTTP request to create the bucket.
 	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
 		0, nil, s.accessKey, s.secretKey, s.signer)
@@ -1252,7 +1273,7 @@ func (s *TestSuiteCommon) TestPutObjectLongName(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	//make long object name.
+	// make long object name.
 	longObjName = fmt.Sprintf("%0255d/%0255d/%0255d/%0255d/%0255d", 1, 1, 1, 1, 1)
 	if IsDocker() || IsKubernetes() {
 		longObjName = fmt.Sprintf("%0242d/%0242d/%0242d/%0242d/%0242d", 1, 1, 1, 1, 1)
@@ -2428,7 +2449,7 @@ func (s *TestSuiteCommon) TestObjectMultipartListError(c *check) {
 	c.Assert(err, nil)
 	// Since max-keys parameter in the ListMultipart request set to invalid value of -2,
 	// its expected to fail with error message "InvalidArgument".
-	verifyError(c, response4, "InvalidArgument", "Argument max-parts must be an integer between 0 and 2147483647", http.StatusBadRequest)
+	verifyError(c, response4, "InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive", http.StatusBadRequest)
 }
 
 // TestObjectValidMD5 - First uploads an object with a valid Content-Md5 header and verifies the status,

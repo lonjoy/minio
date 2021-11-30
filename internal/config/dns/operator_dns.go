@@ -31,7 +31,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/minio/minio/internal/config"
 	xhttp "github.com/minio/minio/internal/http"
 )
@@ -90,16 +90,19 @@ func (c *OperatorDNS) Put(bucket string) error {
 	if err = c.addAuthHeader(req); err != nil {
 		return newError(bucket, err)
 	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		if derr := c.Delete(bucket); derr != nil {
 			return newError(bucket, derr)
 		}
+		return err
 	}
-	var errorStringBuilder strings.Builder
-	io.Copy(&errorStringBuilder, io.LimitReader(resp.Body, resp.ContentLength))
-	xhttp.DrainBody(resp.Body)
+	defer xhttp.DrainBody(resp.Body)
+
 	if resp.StatusCode != http.StatusOK {
+		var errorStringBuilder strings.Builder
+		io.Copy(&errorStringBuilder, io.LimitReader(resp.Body, resp.ContentLength))
 		errorString := errorStringBuilder.String()
 		switch resp.StatusCode {
 		case http.StatusConflict:
@@ -198,9 +201,9 @@ func Authentication(username, password string) OperatorOption {
 }
 
 // RootCAs - add custom trust certs pool
-func RootCAs(CAs *x509.CertPool) OperatorOption {
+func RootCAs(certPool *x509.CertPool) OperatorOption {
 	return func(args *OperatorDNS) {
-		args.rootCAs = CAs
+		args.rootCAs = certPool
 	}
 }
 

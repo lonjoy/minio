@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/minio/madmin-go"
@@ -71,9 +72,9 @@ func prepareAdminErasureTestBed(ctx context.Context) (*adminErasureTestBed, erro
 
 	newAllSubsystems()
 
-	initAllSubsystems(ctx, objLayer)
+	initConfigSubsystem(ctx, objLayer)
 
-	globalIAMSys.InitStore(objLayer)
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, globalNotificationSys, 2*time.Second)
 
 	// Setup admin mgmt REST API handlers.
 	adminRouter := mux.NewRouter()

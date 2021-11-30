@@ -364,9 +364,12 @@ func TestIsReqAuthenticated(t *testing.T) {
 
 	newAllSubsystems()
 
-	initAllSubsystems(context.Background(), objLayer)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	globalIAMSys.InitStore(objLayer)
+	initConfigSubsystem(ctx, objLayer)
+
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, globalNotificationSys, 2*time.Second)
 
 	creds, err := auth.CreateCredentials("myuser", "mypassword")
 	if err != nil {
@@ -392,10 +395,9 @@ func TestIsReqAuthenticated(t *testing.T) {
 		{mustNewSignedRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrNone},
 	}
 
-	ctx := context.Background()
 	// Validates all testcases.
 	for i, testCase := range testCases {
-		s3Error := isReqAuthenticated(ctx, testCase.req, globalServerRegion, serviceS3)
+		s3Error := isReqAuthenticated(ctx, testCase.req, globalSite.Region, serviceS3)
 		if s3Error != testCase.s3Error {
 			if _, err := ioutil.ReadAll(testCase.req.Body); toAPIErrorCode(ctx, err) != testCase.s3Error {
 				t.Fatalf("Test %d: Unexpected S3 error: want %d - got %d (got after reading request %s)", i, testCase.s3Error, s3Error, toAPIError(ctx, err).Code)
@@ -433,15 +435,15 @@ func TestCheckAdminRequestAuthType(t *testing.T) {
 	}
 	ctx := context.Background()
 	for i, testCase := range testCases {
-		if _, s3Error := checkAdminRequestAuth(ctx, testCase.Request, iampolicy.AllAdminActions, globalServerRegion); s3Error != testCase.ErrCode {
+		if _, s3Error := checkAdminRequestAuth(ctx, testCase.Request, iampolicy.AllAdminActions, globalSite.Region); s3Error != testCase.ErrCode {
 			t.Errorf("Test %d: Unexpected s3error returned wanted %d, got %d", i, testCase.ErrCode, s3Error)
 		}
 	}
 }
 
 func TestValidateAdminSignature(t *testing.T) {
-
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	objLayer, fsDir, err := prepareFS()
 	if err != nil {
@@ -455,9 +457,9 @@ func TestValidateAdminSignature(t *testing.T) {
 
 	newAllSubsystems()
 
-	initAllSubsystems(context.Background(), objLayer)
+	initConfigSubsystem(ctx, objLayer)
 
-	globalIAMSys.InitStore(objLayer)
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, globalNotificationSys, 2*time.Second)
 
 	creds, err := auth.CreateCredentials("admin", "mypassword")
 	if err != nil {

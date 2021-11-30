@@ -29,10 +29,11 @@ import (
 )
 
 var (
-	errLifecycleTooManyRules = Errorf("Lifecycle configuration allows a maximum of 1000 rules")
-	errLifecycleNoRule       = Errorf("Lifecycle configuration should have at least one rule")
-	errLifecycleDuplicateID  = Errorf("Lifecycle configuration has rule with the same ID. Rule ID must be unique.")
-	errXMLNotWellFormed      = Errorf("The XML you provided was not well-formed or did not validate against our published schema")
+	errLifecycleTooManyRules                = Errorf("Lifecycle configuration allows a maximum of 1000 rules")
+	errLifecycleNoRule                      = Errorf("Lifecycle configuration should have at least one rule")
+	errLifecycleDuplicateID                 = Errorf("Lifecycle configuration has rule with the same ID. Rule ID must be unique.")
+	errXMLNotWellFormed                     = Errorf("The XML you provided was not well-formed or did not validate against our published schema")
+	errLifecycleInvalidNoncurrentExpiration = Errorf("Exactly one of NoncurrentDays (positive integer) or MaxNoncurrentVersions should be specified in a NoncurrentExpiration rule.")
 )
 
 const (
@@ -57,12 +58,15 @@ const (
 	DeleteVersionAction
 	// TransitionAction transitions a particular object after evaluating lifecycle transition rules
 	TransitionAction
-	//TransitionVersionAction transitions a particular object version after evaluating lifecycle transition rules
+	// TransitionVersionAction transitions a particular object version after evaluating lifecycle transition rules
 	TransitionVersionAction
 	// DeleteRestoredAction means the temporarily restored object needs to be removed after evaluating lifecycle rules
 	DeleteRestoredAction
 	// DeleteRestoredVersionAction deletes a particular version that was temporarily restored
 	DeleteRestoredVersionAction
+
+	// ActionCount must be the last action and shouldn't be used as a regular action.
+	ActionCount
 )
 
 // Lifecycle - Configuration for bucket lifecycle.
@@ -137,7 +141,10 @@ func (lc Lifecycle) HasActiveRules(prefix string, recursive bool) bool {
 		if rule.NoncurrentVersionExpiration.NoncurrentDays > 0 {
 			return true
 		}
-		if rule.NoncurrentVersionTransition.NoncurrentDays > 0 {
+		if rule.NoncurrentVersionExpiration.MaxNoncurrentVersions > 0 {
+			return true
+		}
+		if !rule.NoncurrentVersionTransition.IsNull() {
 			return true
 		}
 		if rule.Expiration.IsNull() && rule.Transition.IsNull() {
@@ -146,12 +153,16 @@ func (lc Lifecycle) HasActiveRules(prefix string, recursive bool) bool {
 		if !rule.Expiration.IsDateNull() && rule.Expiration.Date.Before(time.Now()) {
 			return true
 		}
+		if !rule.Expiration.IsDaysNull() {
+			return true
+		}
 		if !rule.Transition.IsDateNull() && rule.Transition.Date.Before(time.Now()) {
 			return true
 		}
-		if !rule.Expiration.IsDaysNull() || !rule.Transition.IsDaysNull() {
+		if !rule.Transition.IsNull() { // this allows for Transition.Days to be zero.
 			return true
 		}
+
 	}
 	return false
 }
@@ -175,6 +186,7 @@ func (lc Lifecycle) Validate() error {
 	if len(lc.Rules) == 0 {
 		return errLifecycleNoRule
 	}
+
 	// Validate all the rules in the lifecycle config
 	for _, r := range lc.Rules {
 		if err := r.Validate(); err != nil {
@@ -226,10 +238,14 @@ func (lc Lifecycle) FilterActionableRules(obj ObjectOpts) []Rule {
 			rules = append(rules, rule)
 			continue
 		}
+		if rule.NoncurrentVersionExpiration.MaxNoncurrentVersions > 0 {
+			rules = append(rules, rule)
+			continue
+		}
 		// The NoncurrentVersionTransition action requests MinIO to transition
 		// noncurrent versions of objects x days after the objects become
 		// noncurrent.
-		if !rule.NoncurrentVersionTransition.IsDaysNull() {
+		if !rule.NoncurrentVersionTransition.IsNull() {
 			rules = append(rules, rule)
 			continue
 		}
@@ -247,29 +263,17 @@ func (lc Lifecycle) FilterActionableRules(obj ObjectOpts) []Rule {
 // ObjectOpts provides information to deduce the lifecycle actions
 // which can be triggered on the resultant object.
 type ObjectOpts struct {
-	Name                   string
-	UserTags               string
-	ModTime                time.Time
-	VersionID              string
-	IsLatest               bool
-	DeleteMarker           bool
-	NumVersions            int
-	SuccessorModTime       time.Time
-	TransitionStatus       string
-	RestoreOngoing         bool
-	RestoreExpires         time.Time
-	RemoteTiersImmediately []string // strictly for debug only
-}
-
-// doesMatchDebugTiers returns true if tier matches one of the debugTiers, false
-// otherwise.
-func doesMatchDebugTiers(tier string, debugTiers []string) bool {
-	for _, t := range debugTiers {
-		if strings.ToUpper(tier) == strings.ToUpper(t) {
-			return true
-		}
-	}
-	return false
+	Name             string
+	UserTags         string
+	ModTime          time.Time
+	VersionID        string
+	IsLatest         bool
+	DeleteMarker     bool
+	NumVersions      int
+	SuccessorModTime time.Time
+	TransitionStatus string
+	RestoreOngoing   bool
+	RestoreExpires   time.Time
 }
 
 // ExpiredObjectDeleteMarker returns true if an object version referred to by o
@@ -316,17 +320,11 @@ func (lc Lifecycle) ComputeAction(obj ObjectOpts) Action {
 			}
 		}
 
-		if !rule.NoncurrentVersionTransition.IsDaysNull() {
+		if !rule.NoncurrentVersionTransition.IsNull() {
 			if obj.VersionID != "" && !obj.IsLatest && !obj.SuccessorModTime.IsZero() && !obj.DeleteMarker && obj.TransitionStatus != TransitionComplete {
 				// Non current versions should be transitioned if their age exceeds non current days configuration
 				// https://docs.aws.amazon.com/AmazonS3/latest/dev/intro-lifecycle-rules.html#intro-lifecycle-rules-actions
-				if time.Now().After(ExpectedExpiryTime(obj.SuccessorModTime, int(rule.NoncurrentVersionTransition.NoncurrentDays))) {
-					return TransitionVersionAction
-				}
-
-				// this if condition is strictly for debug purposes to force immediate
-				// transition to remote tier if _MINIO_DEBUG_REMOTE_TIERS_IMMEDIATELY is set
-				if doesMatchDebugTiers(rule.NoncurrentVersionTransition.StorageClass, obj.RemoteTiersImmediately) {
+				if due, ok := rule.NoncurrentVersionTransition.NextDue(obj); ok && time.Now().UTC().After(due) {
 					return TransitionVersionAction
 				}
 			}
@@ -346,21 +344,10 @@ func (lc Lifecycle) ComputeAction(obj ObjectOpts) Action {
 			}
 
 			if obj.TransitionStatus != TransitionComplete {
-				switch {
-				case !rule.Transition.IsDateNull():
-					if time.Now().UTC().After(rule.Transition.Date.Time) {
+				if due, ok := rule.Transition.NextDue(obj); ok {
+					if time.Now().UTC().After(due) {
 						action = TransitionAction
 					}
-				case !rule.Transition.IsDaysNull():
-					if time.Now().UTC().After(ExpectedExpiryTime(obj.ModTime, int(rule.Transition.Days))) {
-						action = TransitionAction
-					}
-
-				}
-				// this if condition is strictly for debug purposes to force immediate
-				// transition to remote tier if _MINIO_DEBUG_REMOTE_TIERS_IMMEDIATELY is set
-				if !rule.Transition.IsNull() && doesMatchDebugTiers(rule.Transition.StorageClass, obj.RemoteTiersImmediately) {
-					action = TransitionAction
 				}
 
 				if !obj.RestoreExpires.IsZero() && time.Now().After(obj.RestoreExpires) {
@@ -488,4 +475,33 @@ func (lc Lifecycle) TransitionTier(obj ObjectOpts) string {
 		}
 	}
 	return ""
+}
+
+// NoncurrentVersionsExpirationLimit returns the minimum limit on number of
+// noncurrent versions across rules.
+func (lc Lifecycle) NoncurrentVersionsExpirationLimit(obj ObjectOpts) int {
+	var lim int
+	for _, rule := range lc.FilterActionableRules(obj) {
+		if rule.NoncurrentVersionExpiration.MaxNoncurrentVersions == 0 {
+			continue
+		}
+		if lim == 0 || lim > rule.NoncurrentVersionExpiration.MaxNoncurrentVersions {
+			lim = rule.NoncurrentVersionExpiration.MaxNoncurrentVersions
+		}
+	}
+	return lim
+}
+
+// HasMaxNoncurrentVersions returns true if there exists a rule with
+// MaxNoncurrentVersions limit set.
+func (lc Lifecycle) HasMaxNoncurrentVersions() bool {
+	for _, rule := range lc.Rules {
+		if rule.Status == Disabled {
+			continue
+		}
+		if rule.NoncurrentVersionExpiration.MaxNoncurrentVersions > 0 {
+			return true
+		}
+	}
+	return false
 }

@@ -24,6 +24,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/klauspost/compress/gzhttp"
+	"github.com/minio/console/restapi"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/wildcard"
@@ -39,6 +40,18 @@ func newHTTPServerFn() *xhttp.Server {
 func setHTTPServer(h *xhttp.Server) {
 	globalObjLayerMutex.Lock()
 	globalHTTPServer = h
+	globalObjLayerMutex.Unlock()
+}
+
+func newConsoleServerFn() *restapi.Server {
+	globalObjLayerMutex.RLock()
+	defer globalObjLayerMutex.RUnlock()
+	return globalConsoleSrv
+}
+
+func setConsoleSrv(srv *restapi.Server) {
+	globalObjLayerMutex.Lock()
+	globalConsoleSrv = srv
 	globalObjLayerMutex.Unlock()
 }
 
@@ -241,7 +254,7 @@ func registerAPIRouter(router *mux.Router) {
 			collectAPIStats("listobjectparts", maxClients(gz(httpTraceAll(api.ListObjectPartsHandler))))).Queries("uploadId", "{uploadId:.*}")
 		// CompleteMultipartUpload
 		router.Methods(http.MethodPost).Path("/{object:.+}").HandlerFunc(
-			collectAPIStats("completemutipartupload", maxClients(gz(httpTraceAll(api.CompleteMultipartUploadHandler))))).Queries("uploadId", "{uploadId:.*}")
+			collectAPIStats("completemultipartupload", maxClients(gz(httpTraceAll(api.CompleteMultipartUploadHandler))))).Queries("uploadId", "{uploadId:.*}")
 		// NewMultipartUpload
 		router.Methods(http.MethodPost).Path("/{object:.+}").HandlerFunc(
 			collectAPIStats("newmultipartupload", maxClients(gz(httpTraceAll(api.NewMultipartUploadHandler))))).Queries("uploads", "")
@@ -301,7 +314,8 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodPost).Path("/{object:.+}").HandlerFunc(
 			collectAPIStats("restoreobject", maxClients(gz(httpTraceAll(api.PostRestoreObjectHandler))))).Queries("restore", "")
 
-		/// Bucket operations
+		// Bucket operations
+
 		// GetBucketLocation
 		router.Methods(http.MethodGet).HandlerFunc(
 			collectAPIStats("getbucketlocation", maxClients(gz(httpTraceAll(api.GetBucketLocationHandler))))).Queries("location", "")
@@ -355,7 +369,7 @@ func registerAPIRouter(router *mux.Router) {
 		// GetBucketTaggingHandler
 		router.Methods(http.MethodGet).HandlerFunc(
 			collectAPIStats("getbuckettagging", maxClients(gz(httpTraceAll(api.GetBucketTaggingHandler))))).Queries("tagging", "")
-		//DeleteBucketWebsiteHandler
+		// DeleteBucketWebsiteHandler
 		router.Methods(http.MethodDelete).HandlerFunc(
 			collectAPIStats("deletebucketwebsite", maxClients(gz(httpTraceAll(api.DeleteBucketWebsiteHandler))))).Queries("website", "")
 		// DeleteBucketTaggingHandler
@@ -452,7 +466,7 @@ func registerAPIRouter(router *mux.Router) {
 			collectAPIStats("listobjectsv1", maxClients(gz(httpTraceAll(api.ListObjectsV1Handler)))))
 	}
 
-	/// Root operation
+	// Root operation
 
 	// ListenNotification
 	apiRouter.Methods(http.MethodGet).Path(SlashSeparator).HandlerFunc(

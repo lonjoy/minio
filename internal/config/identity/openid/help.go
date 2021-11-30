@@ -45,14 +45,14 @@ var (
 			Type:        "string",
 		},
 		config.HelpKV{
-			Key:         ClaimPrefix,
-			Description: `JWT claim namespace prefix e.g. "customer1/"`,
+			Key:         ClaimUserinfo,
+			Description: `Enable fetching claims from UserInfo Endpoint for authenticated user`,
 			Optional:    true,
-			Type:        "string",
+			Type:        "on|off",
 		},
 		config.HelpKV{
-			Key:         RedirectURI,
-			Description: `Configure custom redirect_uri for OpenID login flow callback`,
+			Key:         RolePolicy,
+			Description: `Set the IAM access policies applicable to this client application and IDP e.g. "app-bucket-write,app-bucket-list"`,
 			Optional:    true,
 			Type:        "string",
 		},
@@ -81,10 +81,40 @@ var (
 			Type:        "string",
 		},
 		config.HelpKV{
+			Key:         RedirectURIDynamic,
+			Description: `Enable 'Host' header based dynamic redirect URI`,
+			Optional:    true,
+			Type:        "on|off",
+		},
+		config.HelpKV{
+			Key:         ClaimPrefix,
+			Description: `[DEPRECATED use 'claim_name'] JWT claim namespace prefix e.g. "customer1/"`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         RedirectURI,
+			Description: `[DEPRECATED use env 'MINIO_BROWSER_REDIRECT_URL'] Configure custom redirect_uri for OpenID login flow callback`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
 			Key:         config.Comment,
 			Description: config.DefaultComment,
 			Optional:    true,
 			Type:        "sentence",
+		},
+		config.HelpKV{
+			Key:         ClaimPrefix,
+			Description: `[DEPRECATED use 'claim_name'] JWT claim namespace prefix e.g. "customer1/"`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         RedirectURI,
+			Description: `[DEPRECATED use env 'MINIO_BROWSER_REDIRECT_URL'] Configure custom redirect_uri for OpenID login flow callback`,
+			Optional:    true,
+			Type:        "string",
 		},
 	}
 )

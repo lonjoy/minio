@@ -19,9 +19,11 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,7 +89,7 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 	// Fast exit track to check if we are listing an object with
 	// a trailing slash, this will avoid to list the object content.
 	if HasSuffix(opts.BaseDir, SlashSeparator) {
-		metadata, err := s.readMetadata(pathJoin(volumeDir,
+		metadata, err := s.readMetadata(ctx, pathJoin(volumeDir,
 			opts.BaseDir[:len(opts.BaseDir)-1]+globalDirSuffix,
 			xlStorageFormatFile))
 		if err == nil {
@@ -114,6 +116,7 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 		forward := ""
 		if len(opts.ForwardTo) > 0 && strings.HasPrefix(opts.ForwardTo, current) {
 			forward = strings.TrimPrefix(opts.ForwardTo, current)
+			// Trim further directories and trailing slash.
 			if idx := strings.IndexByte(forward, '/'); idx > 0 {
 				forward = forward[:idx]
 			}
@@ -121,6 +124,7 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 		if contextCanceled(ctx) {
 			return ctx.Err()
 		}
+
 		s.walkMu.Lock()
 		entries, err := s.ListDir(ctx, opts.Bucket, current, -1)
 		s.walkMu.Unlock()
@@ -160,7 +164,7 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 					entries[i] = entry
 					continue
 				}
-				// Trim slash, maybe compiler is clever?
+				// Trim slash, since we don't know if this is folder or object.
 				entries[i] = entries[i][:len(entry)-1]
 				continue
 			}
@@ -173,9 +177,9 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 			// If root was an object return it as such.
 			if HasSuffix(entry, xlStorageFormatFile) {
 				var meta metaCacheEntry
-				s.walkMu.Lock()
-				meta.metadata, err = s.readMetadata(pathJoin(volumeDir, current, entry))
-				s.walkMu.Unlock()
+				s.walkReadMu.Lock()
+				meta.metadata, err = s.readMetadata(ctx, pathJoin(volumeDir, current, entry))
+				s.walkReadMu.Unlock()
 				if err != nil {
 					logger.LogIf(ctx, err)
 					continue
@@ -190,9 +194,9 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 			// Check legacy.
 			if HasSuffix(entry, xlStorageFormatFileV1) {
 				var meta metaCacheEntry
-				s.walkMu.Lock()
+				s.walkReadMu.Lock()
 				meta.metadata, err = xioutil.ReadFile(pathJoin(volumeDir, current, entry))
-				s.walkMu.Unlock()
+				s.walkReadMu.Unlock()
 				if err != nil {
 					logger.LogIf(ctx, err)
 					continue
@@ -211,9 +215,12 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 		dirStack := make([]string, 0, 5)
 		prefix = "" // Remove prefix after first level as we have already filtered the list.
 		if len(forward) > 0 {
-			idx := sort.SearchStrings(entries, forward)
-			if idx > 0 {
-				entries = entries[idx:]
+			// Conservative forwarding. Entries may be either objects or prefixes.
+			for i, entry := range entries {
+				if entry >= forward || strings.HasPrefix(forward, entry) {
+					entries = entries[i:]
+					break
+				}
 			}
 		}
 
@@ -248,9 +255,9 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 				meta.name = meta.name[:len(meta.name)-1] + globalDirSuffixWithSlash
 			}
 
-			s.walkMu.Lock()
-			meta.metadata, err = s.readMetadata(pathJoin(volumeDir, meta.name, xlStorageFormatFile))
-			s.walkMu.Unlock()
+			s.walkReadMu.Lock()
+			meta.metadata, err = s.readMetadata(ctx, pathJoin(volumeDir, meta.name, xlStorageFormatFile))
+			s.walkReadMu.Unlock()
 			switch {
 			case err == nil:
 				// It was an object
@@ -259,9 +266,7 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 				}
 				out <- meta
 			case osIsNotExist(err), isSysErrIsDir(err):
-				s.walkMu.Lock()
 				meta.metadata, err = xioutil.ReadFile(pathJoin(volumeDir, meta.name, xlStorageFormatFileV1))
-				s.walkMu.Unlock()
 				if err == nil {
 					// It was an object
 					out <- meta
@@ -301,9 +306,15 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 
 func (p *xlStorageDiskIDCheck) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writer) error {
 	defer p.updateStorageMetrics(storageMetricWalkDir, opts.Bucket, opts.BaseDir)()
+
+	if contextCanceled(ctx) {
+		return ctx.Err()
+	}
+
 	if err := p.checkDiskStale(); err != nil {
 		return err
 	}
+
 	return p.storage.WalkDir(ctx, opts, wr)
 }
 
@@ -352,6 +363,12 @@ func (s *storageRESTServer) WalkDirHandler(w http.ResponseWriter, r *http.Reques
 	prefix := r.Form.Get(storageRESTPrefixFilter)
 	forward := r.Form.Get(storageRESTForwardFilter)
 	writer := streamHTTPResponse(w)
+	defer func() {
+		if r := recover(); r != nil {
+			debug.PrintStack()
+			writer.CloseWithError(fmt.Errorf("panic: %v", r))
+		}
+	}()
 	writer.CloseWithError(s.storage.WalkDir(r.Context(), WalkDirOptions{
 		Bucket:         volume,
 		BaseDir:        dirPath,

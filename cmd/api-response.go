@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
@@ -38,7 +39,7 @@ const (
 	// RFC3339 a subset of the ISO8601 timestamp format. e.g 2014-04-29T18:30:38Z
 	iso8601TimeFormat = "2006-01-02T15:04:05.000Z" // Reply date format with nanosecond precision.
 	maxObjectList     = 1000                       // Limit number of objects in a listObjectsResponse/listObjectsVersionsResponse.
-	maxDeleteList     = 10000                      // Limit number of objects deleted in a delete call.
+	maxDeleteList     = 1000                       // Limit number of objects deleted in a delete call.
 	maxUploadsList    = 10000                      // Limit number of uploads in a listUploadsResponse.
 	maxPartsList      = 10000                      // Limit number of parts in a listPartsResponse.
 )
@@ -262,7 +263,7 @@ func (o ObjectVersion) MarshalXML(e *xml.Encoder, start xml.StartElement) error 
 	return e.EncodeElement(objectVersionWrapper(o), start)
 }
 
-// StringMap is a map[string]string.
+// StringMap is a map[string]string
 type StringMap map[string]string
 
 // MarshalXML - StringMap marshals into XML.
@@ -423,10 +424,10 @@ func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 	}
 
 	for _, bucket := range buckets {
-		var listbucket = Bucket{}
-		listbucket.Name = bucket.Name
-		listbucket.CreationDate = bucket.Created.UTC().Format(iso8601TimeFormat)
-		listbuckets = append(listbuckets, listbucket)
+		listbuckets = append(listbuckets, Bucket{
+			Name:         bucket.Name,
+			CreationDate: bucket.Created.UTC().Format(iso8601TimeFormat),
+		})
 	}
 
 	data.Owner = owner
@@ -570,6 +571,14 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 		content.Owner = owner
 		if metadata {
 			content.UserMetadata = make(StringMap)
+			switch kind, _ := crypto.IsEncrypted(object.UserDefined); kind {
+			case crypto.S3:
+				content.UserMetadata[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
+			case crypto.S3KMS:
+				content.UserMetadata[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionKMS
+			case crypto.SSEC:
+				content.UserMetadata[xhttp.AmzServerSideEncryptionCustomerAlgorithm] = xhttp.AmzEncryptionAES
+			}
 			for k, v := range CleanMinioInternalMetadataKeys(object.UserDefined) {
 				if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
 					// Do not need to send any internal metadata
@@ -715,9 +724,6 @@ func generateMultiDeleteResponse(quiet bool, deletedObjects []DeletedObject, err
 	if !quiet {
 		deleteResp.DeletedObjects = deletedObjects
 	}
-	if len(errs) == len(deletedObjects) {
-		deleteResp.DeletedObjects = nil
-	}
 	deleteResp.Errors = errs
 	return deleteResp
 }
@@ -731,7 +737,6 @@ func writeResponse(w http.ResponseWriter, statusCode int, response []byte, mType
 	w.WriteHeader(statusCode)
 	if response != nil {
 		w.Write(response)
-		w.(http.Flusher).Flush()
 	}
 }
 
@@ -782,9 +787,9 @@ func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError
 		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
 		w.Header().Set(xhttp.RetryAfter, "120")
 	case "InvalidRegion":
-		err.Description = fmt.Sprintf("Region does not match; expecting '%s'.", globalServerRegion)
+		err.Description = fmt.Sprintf("Region does not match; expecting '%s'.", globalSite.Region)
 	case "AuthorizationHeaderMalformed":
-		err.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalServerRegion)
+		err.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalSite.Region)
 	}
 
 	// Generate error response.

@@ -22,7 +22,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"time"
 	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
@@ -35,30 +34,44 @@ import (
 
 // IAMObjectStore implements IAMStorageAPI
 type IAMObjectStore struct {
-	// Protect assignment to objAPI
+	// Protect access to storage within the current server.
 	sync.RWMutex
+
+	*iamCache
+
+	usersSysType UsersSysType
 
 	objAPI ObjectLayer
 }
 
-func newIAMObjectStore(objAPI ObjectLayer) *IAMObjectStore {
-	return &IAMObjectStore{objAPI: objAPI}
+func newIAMObjectStore(objAPI ObjectLayer, usersSysType UsersSysType) *IAMObjectStore {
+	return &IAMObjectStore{
+		iamCache:     newIamCache(),
+		objAPI:       objAPI,
+		usersSysType: usersSysType,
+	}
 }
 
-func (iamOS *IAMObjectStore) lock() {
+func (iamOS *IAMObjectStore) rlock() *iamCache {
+	iamOS.RLock()
+	return iamOS.iamCache
+}
+
+func (iamOS *IAMObjectStore) runlock() {
+	iamOS.RUnlock()
+}
+
+func (iamOS *IAMObjectStore) lock() *iamCache {
 	iamOS.Lock()
+	return iamOS.iamCache
 }
 
 func (iamOS *IAMObjectStore) unlock() {
 	iamOS.Unlock()
 }
 
-func (iamOS *IAMObjectStore) rlock() {
-	iamOS.RLock()
-}
-
-func (iamOS *IAMObjectStore) runlock() {
-	iamOS.RUnlock()
+func (iamOS *IAMObjectStore) getUsersSysType() UsersSysType {
+	return iamOS.usersSysType
 }
 
 // Migrate users directory in a single scan.
@@ -183,6 +196,8 @@ func (iamOS *IAMObjectStore) migrateToV1(ctx context.Context) error {
 
 // Should be called under config migration lock
 func (iamOS *IAMObjectStore) migrateBackendFormat(ctx context.Context) error {
+	iamOS.Lock()
+	defer iamOS.Unlock()
 	return iamOS.migrateToV1(ctx)
 }
 
@@ -370,11 +385,6 @@ func (iamOS *IAMObjectStore) loadMappedPolicies(ctx context.Context, userType IA
 	return nil
 }
 
-// Refresh IAMSys. If an object layer is passed in use that, otherwise load from global.
-func (iamOS *IAMObjectStore) loadAll(ctx context.Context, sys *IAMSys) error {
-	return sys.Load(ctx, iamOS)
-}
-
 func (iamOS *IAMObjectStore) savePolicyDoc(ctx context.Context, policyName string, p iampolicy.Policy) error {
 	return iamOS.saveIAMConfig(ctx, &p, getPolicyDocPath(policyName))
 }
@@ -462,14 +472,4 @@ func listIAMConfigItems(ctx context.Context, objAPI ObjectLayer, pathPrefix stri
 	}()
 
 	return ch
-}
-
-func (iamOS *IAMObjectStore) watch(ctx context.Context, sys *IAMSys) {
-	// Refresh IAMSys.
-	for {
-		time.Sleep(globalRefreshIAMInterval)
-		if err := iamOS.loadAll(ctx, sys); err != nil {
-			logger.LogIf(ctx, err)
-		}
-	}
 }

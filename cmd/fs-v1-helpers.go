@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/lock"
 	"github.com/minio/minio/internal/logger"
 )
@@ -268,6 +269,7 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 	// Stat to get the size of the file at path.
 	st, err := fr.Stat()
 	if err != nil {
+		fr.Close()
 		err = osErrToFileErr(err)
 		if err != errFileNotFound {
 			logger.LogIf(ctx, err)
@@ -277,6 +279,7 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 
 	// Verify if its not a regular file, since subsequent Seek is undefined.
 	if !st.Mode().IsRegular() {
+		fr.Close()
 		return nil, 0, errIsNotRegular
 	}
 
@@ -284,6 +287,7 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 	if offset > 0 {
 		_, err = fr.Seek(offset, io.SeekStart)
 		if err != nil {
+			fr.Close()
 			logger.LogIf(ctx, err)
 			return nil, 0, err
 		}
@@ -323,7 +327,7 @@ func fsCreateFile(ctx context.Context, filePath string, reader io.Reader, falloc
 
 	flags := os.O_CREATE | os.O_WRONLY
 	if globalFSOSync {
-		flags = flags | os.O_SYNC
+		flags |= os.O_SYNC
 	}
 	writer, err := lock.Open(filePath, flags, 0666)
 	if err != nil {
@@ -331,7 +335,7 @@ func fsCreateFile(ctx context.Context, filePath string, reader io.Reader, falloc
 	}
 	defer writer.Close()
 
-	bytesWritten, err := io.Copy(writer, reader)
+	bytesWritten, err := xioutil.Copy(writer, reader)
 	if err != nil {
 		logger.LogIf(ctx, err)
 		return 0, err

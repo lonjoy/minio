@@ -113,7 +113,7 @@ func (l *s3EncObjects) ListObjectsV2(ctx context.Context, bucket, prefix, contin
 			} else {
 				objects = append(objects, obj)
 			}
-			if len(objects) > maxKeys {
+			if maxKeys > 0 && len(objects) > maxKeys {
 				break
 			}
 		}
@@ -130,7 +130,7 @@ func (l *s3EncObjects) ListObjectsV2(ctx context.Context, bucket, prefix, contin
 				prefixes = append(prefixes, p)
 			}
 		}
-		if (len(objects) > maxKeys) || !loi.IsTruncated {
+		if (maxKeys > 0 && len(objects) > maxKeys) || !loi.IsTruncated {
 			break
 		}
 	}
@@ -668,7 +668,7 @@ func (l *s3EncObjects) CompleteMultipartUpload(ctx context.Context, bucket, obje
 		return oi, e
 	}
 
-	//delete any unencrypted version of object that might be on the backend
+	// delete any unencrypted version of object that might be on the backend
 	defer l.s3Objects.DeleteObject(ctx, bucket, object, opts)
 
 	// Save the final object size and modtime.
@@ -784,7 +784,7 @@ func (l *s3EncObjects) getStalePartsForBucket(ctx context.Context, bucket string
 	return
 }
 
-func (l *s3EncObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+func (l *s3EncObjects) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
 	var prefix, continuationToken, delimiter, startAfter string
 	expParts := make(map[string]string)
 

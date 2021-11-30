@@ -37,20 +37,26 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
 	"github.com/minio/madmin-go"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
+	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/api"
+	xtls "github.com/minio/minio/internal/config/identity/tls"
+	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/logger/message/audit"
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/pkg/certs"
+	"github.com/minio/pkg/env"
 )
 
 const (
@@ -159,7 +165,7 @@ func hasContentMD5(h http.Header) bool {
 	return ok
 }
 
-/// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
+// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
 const (
 	// Maximum object size per PUT request is 5TB.
 	// This is a divergence from S3 limit on purpose to support
@@ -408,7 +414,7 @@ func dumpRequest(r *http.Request) string {
 	header.Set("Host", r.Host)
 	// Replace all '%' to '%%' so that printer format parser
 	// to ignore URL encoded values.
-	rawURI := strings.Replace(r.RequestURI, "%", "%%", -1)
+	rawURI := strings.ReplaceAll(r.RequestURI, "%", "%%")
 	req := struct {
 		Method     string      `json:"method"`
 		RequestURI string      `json:"reqURI"`
@@ -969,4 +975,161 @@ func auditLogInternal(ctx context.Context, bucket, object string, opts AuditLogO
 	entry.API.Status = opts.Status
 	ctx = logger.SetAuditEntry(ctx, &entry)
 	logger.AuditLog(ctx, nil, nil, nil)
+}
+
+type speedTestOpts struct {
+	throughputSize   int
+	concurrencyStart int
+	duration         time.Duration
+	autotune         bool
+	storageClass     string
+}
+
+// Get the max throughput and iops numbers.
+func speedTest(ctx context.Context, opts speedTestOpts) chan madmin.SpeedTestResult {
+	ch := make(chan madmin.SpeedTestResult, 1)
+	go func() {
+		defer close(ch)
+
+		concurrency := opts.concurrencyStart
+
+		throughputHighestGet := uint64(0)
+		throughputHighestPut := uint64(0)
+		var throughputHighestResults []SpeedtestResult
+
+		sendResult := func() {
+			var result madmin.SpeedTestResult
+
+			durationSecs := opts.duration.Seconds()
+
+			result.GETStats.ThroughputPerSec = throughputHighestGet / uint64(durationSecs)
+			result.GETStats.ObjectsPerSec = throughputHighestGet / uint64(opts.throughputSize) / uint64(durationSecs)
+			result.PUTStats.ThroughputPerSec = throughputHighestPut / uint64(durationSecs)
+			result.PUTStats.ObjectsPerSec = throughputHighestPut / uint64(opts.throughputSize) / uint64(durationSecs)
+			for i := 0; i < len(throughputHighestResults); i++ {
+				errStr := ""
+				if throughputHighestResults[i].Error != "" {
+					errStr = throughputHighestResults[i].Error
+				}
+				result.PUTStats.Servers = append(result.PUTStats.Servers, madmin.SpeedTestStatServer{
+					Endpoint:         throughputHighestResults[i].Endpoint,
+					ThroughputPerSec: throughputHighestResults[i].Uploads / uint64(durationSecs),
+					ObjectsPerSec:    throughputHighestResults[i].Uploads / uint64(opts.throughputSize) / uint64(durationSecs),
+					Err:              errStr,
+				})
+				result.GETStats.Servers = append(result.GETStats.Servers, madmin.SpeedTestStatServer{
+					Endpoint:         throughputHighestResults[i].Endpoint,
+					ThroughputPerSec: throughputHighestResults[i].Downloads / uint64(durationSecs),
+					ObjectsPerSec:    throughputHighestResults[i].Downloads / uint64(opts.throughputSize) / uint64(durationSecs),
+					Err:              errStr,
+				})
+			}
+
+			result.Size = opts.throughputSize
+			result.Disks = globalEndpoints.NEndpoints()
+			result.Servers = len(globalNotificationSys.peerClients) + 1
+			result.Version = Version
+			result.Concurrent = concurrency
+
+			ch <- result
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				// If the client got disconnected stop the speedtest.
+				return
+			default:
+			}
+
+			results := globalNotificationSys.Speedtest(ctx,
+				opts.throughputSize, concurrency,
+				opts.duration, opts.storageClass)
+			sort.Slice(results, func(i, j int) bool {
+				return results[i].Endpoint < results[j].Endpoint
+			})
+
+			totalPut := uint64(0)
+			totalGet := uint64(0)
+			for _, result := range results {
+				totalPut += result.Uploads
+				totalGet += result.Downloads
+			}
+
+			if totalGet < throughputHighestGet {
+				// Following check is for situations
+				// when Writes() scale higher than Reads()
+				// - practically speaking this never happens
+				// and should never happen - however it has
+				// been seen recently due to hardware issues
+				// causes Reads() to go slower than Writes().
+				//
+				// Send such results anyways as this shall
+				// expose a problem underneath.
+				if totalPut > throughputHighestPut {
+					throughputHighestResults = results
+					throughputHighestPut = totalPut
+					// let the client see lower value as well
+					throughputHighestGet = totalGet
+				}
+				sendResult()
+				break
+			}
+
+			doBreak := false
+			if float64(totalGet-throughputHighestGet)/float64(totalGet) < 0.025 {
+				doBreak = true
+			}
+
+			throughputHighestGet = totalGet
+			throughputHighestResults = results
+			throughputHighestPut = totalPut
+
+			if doBreak {
+				sendResult()
+				break
+			}
+
+			if !opts.autotune {
+				sendResult()
+				break
+			}
+
+			sendResult()
+			// Try with a higher concurrency to see if we get better throughput
+			concurrency += (concurrency + 1) / 2
+		}
+	}()
+	return ch
+}
+
+func newTLSConfig(getCert certs.GetCertificateFunc) *tls.Config {
+	if getCert == nil {
+		return nil
+	}
+
+	tlsConfig := &tls.Config{
+		PreferServerCipherSuites: true,
+		MinVersion:               tls.VersionTLS12,
+		NextProtos:               []string{"http/1.1", "h2"},
+		GetCertificate:           getCert,
+	}
+
+	tlsClientIdentity := env.Get(xtls.EnvIdentityTLSEnabled, "") == config.EnableOn
+	if tlsClientIdentity {
+		tlsConfig.ClientAuth = tls.RequestClientCert
+	}
+
+	secureCiphers := env.Get(api.EnvAPISecureCiphers, config.EnableOn) == config.EnableOn
+	if secureCiphers || fips.Enabled {
+		// Hardened ciphers
+		tlsConfig.CipherSuites = fips.CipherSuitesTLS()
+		tlsConfig.CurvePreferences = fips.EllipticCurvesTLS()
+	} else {
+		// Default ciphers while excluding those with security issues
+		for _, cipher := range tls.CipherSuites() {
+			tlsConfig.CipherSuites = append(tlsConfig.CipherSuites, cipher.ID)
+		}
+	}
+	return tlsConfig
 }

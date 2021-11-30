@@ -39,6 +39,11 @@ func reduceErrs(errs []error, ignoredErrs []error) (maxCount int, maxErr error) 
 		if IsErrIgnored(err, ignoredErrs...) {
 			continue
 		}
+		// Errors due to context cancelation may be wrapped - group them by context.Canceled.
+		if errors.Is(err, context.Canceled) {
+			errorCounts[context.Canceled]++
+			continue
+		}
 		errorCounts[err]++
 	}
 
@@ -174,6 +179,10 @@ func shuffleDisksAndPartsMetadataByIndex(disks []StorageAPI, metaArr []FileInfo,
 			inconsistent++
 			continue
 		}
+		if meta.XLV1 != fi.XLV1 {
+			inconsistent++
+			continue
+		}
 		// check if erasure distribution order matches the index
 		// position if this is not correct we discard the disk
 		// and move to collect others
@@ -221,6 +230,9 @@ func shuffleDisksAndPartsMetadata(disks []StorageAPI, partsMetadata []FileInfo, 
 			// Check for length of data parts only when
 			// fi.ModTime is not empty - ModTime is always set,
 			// if object was ever written previously.
+			continue
+		}
+		if !init && fi.XLV1 != partsMetadata[index].XLV1 {
 			continue
 		}
 		blockIndex := distribution[index]

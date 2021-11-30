@@ -109,7 +109,7 @@ func (s3 ssekms) UnsealObjectKey(KMS kms.KMS, metadata map[string]string, bucket
 	if err != nil {
 		return key, err
 	}
-	err = key.Unseal(unsealKey[:], sealedKey, s3.String(), bucket, object)
+	err = key.Unseal(unsealKey, sealedKey, s3.String(), bucket, object)
 	return key, err
 }
 
@@ -210,8 +210,8 @@ func (ssekms) ParseMetadata(metadata map[string]string) (keyID string, kmsKey []
 			return keyID, kmsKey, sealedKey, ctx, Errorf("The internal KMS context is not base64-encoded")
 		}
 		var json = jsoniter.ConfigCompatibleWithStandardLibrary
-		if err = json.Unmarshal(b, ctx); err != nil {
-			return keyID, kmsKey, sealedKey, ctx, Errorf("The internal sealed KMS context is invalid")
+		if err = json.Unmarshal(b, &ctx); err != nil {
+			return keyID, kmsKey, sealedKey, ctx, Errorf("The internal sealed KMS context is invalid %w", err)
 		}
 	}
 
